@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Website Agent Server</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="toolbar" aria-label="Browser controls">
+        <button id="back-button" class="tool-button" type="button" title="Back" disabled>Back</button>
+        <button id="forward-button" class="tool-button" type="button" title="Forward" disabled>Forward</button>
+        <button id="reload-button" class="tool-button" type="button" title="Reload" disabled>Reload</button>
+        <form id="address-form" class="address-form" autocomplete="off">
+          <input
+            id="address-input"
+            name="address"
+            type="text"
+            inputmode="url"
+            placeholder="https://example.com"
+            spellcheck="false"
+            disabled
+          />
+          <button id="go-button" class="primary-button" type="submit" disabled>Go</button>
+        </form>
+        <span id="status-text" class="status-text">Idle</span>
+      </header>
+
+      <section id="viewport-wrap" class="viewport-wrap" aria-label="Remote browser viewport">
+        <canvas id="viewport" tabindex="0"></canvas>
+        <textarea
+          id="input-proxy"
+          class="input-proxy"
+          aria-label="Remote text input"
+          autocomplete="off"
+          autocapitalize="off"
+          autocorrect="off"
+          spellcheck="false"
+        ></textarea>
+      </section>
+    </main>
+
+    <div id="launcher" class="launcher-backdrop">
+      <form id="launch-form" class="launcher" autocomplete="off">
+        <h1>Website Agent Server</h1>
+        <label for="target-url">Website URL</label>
+        <div class="launch-row">
+          <input
+            id="target-url"
+            name="target-url"
+            type="text"
+            inputmode="url"
+            placeholder="https://example.com"
+            spellcheck="false"
+            required
+            autofocus
+          />
+          <button class="primary-button" type="submit">Open</button>
+        </div>
+        <p id="launch-error" class="error-text" role="alert"></p>
+      </form>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Website Agent Server PIN</title>
+    <link rel="stylesheet" href="/auth-static/auth.css" />
+  </head>
+  <body>
+    <main class="auth-shell">
+      <form class="auth-panel" method="post" action="/auth" autocomplete="off">
+        <h1>Website Agent Server</h1>
+        <label for="pin">PIN</label>
+        <div class="auth-row">
+          <input
+            id="pin"
+            name="pin"
+            type="password"
+            inputmode="numeric"
+            autocomplete="current-password"
+            required
+            autofocus
+          />
+          <button type="submit">Enter</button>
+        </div>
+        <p id="error" class="error-text" hidden>Incorrect PIN.</p>
+      </form>
+      <script src="/auth-static/auth.js"></script>
+    </main>
+  </body>
+</html>

@@ -203,6 +203,9 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Website Agent Server runtime data
+.agent-data/
+
 # Ruff stuff:
 .ruff_cache/
 
