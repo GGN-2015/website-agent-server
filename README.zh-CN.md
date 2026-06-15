@@ -48,6 +48,7 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--host` | `127.0.0.1` | 服务监听地址。 |
+| `--allow-lan` | 禁用 | 允许局域网客户端访问；如果没有设置 `--host`，会监听 `0.0.0.0`。 |
 | `--port` | `8000` | 服务端口。 |
 | `--headed` | 禁用 | 使用可见浏览器窗口运行 Chromium。 |
 | `--ignore-https-errors` | 禁用 | 忽略远程 TLS 证书错误。 |
@@ -64,6 +65,12 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | `--pin` | 禁用 | 要求用户提供该 PIN 后才能访问代理 UI、API 和 WebSocket。 |
 
 默认会阻止私有和本地网络目标，以降低 SSRF 风险。只有在你信任所有能访问该代理的用户时，才建议使用 `--allow-private-hosts`。
+
+如果要暴露给局域网，建议同时设置 PIN：
+
+```powershell
+venv\Scripts\python.exe -m website_agent_server --allow-lan --pin 123456
+```
 
 ## 限制
 

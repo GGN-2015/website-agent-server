@@ -8,12 +8,20 @@ import uvicorn
 from .config import settings
 
 
+DEFAULT_HOST = settings.host
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="website-agent-server",
         description="Run the server-side browser proxy.",
     )
-    parser.add_argument("--host", default=settings.host, help="Server bind host.")
+    parser.add_argument("--host", default=None, help="Server bind host.")
+    parser.add_argument(
+        "--allow-lan",
+        action="store_true",
+        help="Allow LAN clients by binding to 0.0.0.0 unless --host is set.",
+    )
     parser.add_argument("--port", type=int, default=settings.port, help="Server port.")
     parser.add_argument(
         "--headed",
@@ -93,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def apply_args(args: argparse.Namespace) -> None:
-    settings.host = args.host
+    settings.host = args.host or ("0.0.0.0" if args.allow_lan else DEFAULT_HOST)
     settings.port = args.port
     settings.headless = not args.headed
     settings.ignore_https_errors = args.ignore_https_errors

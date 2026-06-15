@@ -48,6 +48,7 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | Option | Default | Description |
 | --- | --- | --- |
 | `--host` | `127.0.0.1` | Server bind host. |
+| `--allow-lan` | disabled | Allow LAN clients by binding to `0.0.0.0` unless `--host` is set. |
 | `--port` | `8000` | Server port. |
 | `--headed` | disabled | Run Chromium with a visible browser window. |
 | `--ignore-https-errors` | disabled | Ignore remote TLS certificate errors. |
@@ -64,6 +65,12 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | `--pin` | disabled | Require this PIN before clients can access the proxy UI, API, or WebSocket. |
 
 Private and local network targets are blocked by default to reduce SSRF risk. Use `--allow-private-hosts` only when you trust the users who can access the proxy.
+
+When exposing the server to a LAN, prefer using a PIN:
+
+```powershell
+venv\Scripts\python.exe -m website_agent_server --allow-lan --pin 123456
+```
 
 ## Limitations
 
