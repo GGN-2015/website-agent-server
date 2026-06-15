@@ -9,9 +9,14 @@
   <body>
     <main class="app-shell">
       <header class="toolbar" aria-label="Browser controls">
-        <button id="back-button" class="tool-button" type="button" title="Back" disabled>Back</button>
-        <button id="forward-button" class="tool-button" type="button" title="Forward" disabled>Forward</button>
-        <button id="reload-button" class="tool-button" type="button" title="Reload" disabled>Reload</button>
+        <div id="browser-controls" class="browser-controls">
+          <button id="back-button" class="tool-button" type="button" title="Back" disabled>Back</button>
+          <button id="forward-button" class="tool-button" type="button" title="Forward" disabled>Forward</button>
+          <button id="reload-button" class="tool-button" type="button" title="Reload" disabled>Reload</button>
+          <button id="cookie-button" class="tool-button" type="button" title="Cookies" disabled>Cookie</button>
+          <button id="quit-button" class="danger-button" type="button" title="Quit" disabled>Quit</button>
+        </div>
+        <p id="locked-message" class="locked-message" hidden>website agent server: options locked.</p>
         <form id="address-form" class="address-form" autocomplete="off">
           <input
             id="address-input"
@@ -41,7 +46,7 @@
       </section>
     </main>
 
-    <div id="launcher" class="launcher-backdrop">
+    <div id="launcher" class="launcher-backdrop" hidden>
       <form id="launch-form" class="launcher" autocomplete="off">
         <h1>Website Agent Server</h1>
         <label for="target-url">Website URL</label>
@@ -60,6 +65,26 @@
         </div>
         <p id="launch-error" class="error-text" role="alert"></p>
       </form>
+    </div>
+
+    <div id="cookie-dialog" class="modal-backdrop" hidden>
+      <section class="modal-panel cookie-panel" role="dialog" aria-modal="true" aria-labelledby="cookie-title">
+        <header class="modal-header">
+          <div>
+            <h2 id="cookie-title">Cookies</h2>
+            <p id="cookie-summary" class="modal-subtitle">Current page</p>
+          </div>
+          <button id="cookie-close-button" class="icon-button" type="button" title="Close" aria-label="Close">x</button>
+        </header>
+        <div id="cookie-error" class="modal-error" role="alert"></div>
+        <div id="cookie-list" class="cookie-list"></div>
+        <footer class="modal-footer">
+          <button id="cookie-add-button" class="tool-button" type="button">Add</button>
+          <span id="cookie-count" class="cookie-count"></span>
+          <button id="cookie-cancel-button" class="tool-button" type="button">Cancel</button>
+          <button id="cookie-save-button" class="primary-button" type="button">Save</button>
+        </footer>
+      </section>
     </div>
 
     <script src="/static/app.js"></script>

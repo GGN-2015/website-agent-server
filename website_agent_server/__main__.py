@@ -6,9 +6,7 @@ from pathlib import Path
 import uvicorn
 
 from .config import settings
-
-
-DEFAULT_HOST = settings.host
+from .url_policy import normalize_target_url
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -16,12 +14,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="website-agent-server",
         description="Run the server-side browser proxy.",
     )
-    parser.add_argument("--host", default=None, help="Server bind host.")
-    parser.add_argument(
-        "--allow-lan",
-        action="store_true",
-        help="Allow LAN clients by binding to 0.0.0.0 unless --host is set.",
-    )
+    parser.add_argument("--host", default=settings.host, help="Server bind host.")
     parser.add_argument("--port", type=int, default=settings.port, help="Server port.")
     parser.add_argument(
         "--headed",
@@ -97,11 +90,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Require this PIN before clients can use the proxy.",
     )
+    parser.add_argument(
+        "--lock-url",
+        default=None,
+        help="Lock the UI to this initial URL and disable browser option controls.",
+    )
     return parser
 
 
 def apply_args(args: argparse.Namespace) -> None:
-    settings.host = args.host or ("0.0.0.0" if args.allow_lan else DEFAULT_HOST)
+    settings.host = args.host
     settings.port = args.port
     settings.headless = not args.headed
     settings.ignore_https_errors = args.ignore_https_errors
@@ -116,12 +114,16 @@ def apply_args(args: argparse.Namespace) -> None:
     settings.max_viewport_height = args.max_viewport_height
     settings.data_dir = args.data_dir.resolve()
     settings.pin = args.pin
+    settings.lock_url = normalize_target_url(args.lock_url) if args.lock_url else None
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    apply_args(args)
+    try:
+        apply_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     uvicorn.run(
         "website_agent_server.main:app",
         host=settings.host,

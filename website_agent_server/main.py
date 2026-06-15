@@ -42,12 +42,37 @@ class CreateSessionResponse(BaseModel):
     url: str
 
 
+class ClientConfigResponse(BaseModel):
+    locked: bool
+    lock_url: str | None = None
+
+
 class ClipboardRequest(BaseModel):
     cut: bool = False
 
 
 class ClipboardResponse(BaseModel):
     text: str
+
+
+class CookieRecord(BaseModel):
+    name: str = Field(min_length=1, max_length=4096)
+    value: str = Field(default="", max_length=16384)
+    domain: str = Field(default="", max_length=4096)
+    path: str = Field(default="/", max_length=4096)
+    expires: float | None = None
+    httpOnly: bool = False
+    secure: bool = False
+    sameSite: str | None = None
+    partitionKey: str | None = None
+
+
+class CookieListResponse(BaseModel):
+    cookies: list[CookieRecord]
+
+
+class CookieUpdateRequest(BaseModel):
+    cookies: list[CookieRecord]
 
 
 @app.get("/")
@@ -102,6 +127,12 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/config", response_model=ClientConfigResponse)
+async def client_config(request: Request) -> ClientConfigResponse:
+    pin_auth.require_request(request)
+    return ClientConfigResponse(locked=settings.lock_url is not None, lock_url=settings.lock_url)
+
+
 @app.post("/auth")
 async def authenticate(pin: Annotated[str, Form()]) -> RedirectResponse:
     if not pin_auth.verify_pin(pin):
@@ -123,8 +154,9 @@ async def create_session(
     request: Request, payload: CreateSessionRequest
 ) -> CreateSessionResponse:
     pin_auth.require_request(request)
+    target_url = settings.lock_url or payload.url
     try:
-        session = await manager.create_session(payload.url, payload.width, payload.height)
+        session = await manager.create_session(target_url, payload.width, payload.height)
     except URLPolicyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -150,6 +182,35 @@ async def read_clipboard_selection(
         raise HTTPException(status_code=404, detail="Session not found.")
     text = await session.copy_selection(cut=payload.cut)
     return ClipboardResponse(text=text)
+
+
+@app.get("/api/sessions/{session_id}/cookies", response_model=CookieListResponse)
+async def list_cookies(request: Request, session_id: str) -> CookieListResponse:
+    pin_auth.require_request(request)
+    if settings.lock_url is not None:
+        raise HTTPException(status_code=403, detail="Cookie management is locked.")
+    session = manager.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    cookies = await session.list_cookies()
+    return CookieListResponse(cookies=[CookieRecord(**cookie) for cookie in cookies])
+
+
+@app.put("/api/sessions/{session_id}/cookies", response_model=CookieListResponse)
+async def update_cookies(
+    request: Request, session_id: str, payload: CookieUpdateRequest
+) -> CookieListResponse:
+    pin_auth.require_request(request)
+    if settings.lock_url is not None:
+        raise HTTPException(status_code=403, detail="Cookie management is locked.")
+    session = manager.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    try:
+        cookies = await session.replace_cookies([cookie.model_dump() for cookie in payload.cookies])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return CookieListResponse(cookies=[CookieRecord(**cookie) for cookie in cookies])
 
 
 @app.websocket("/ws/{session_id}")

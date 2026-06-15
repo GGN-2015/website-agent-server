@@ -11,7 +11,7 @@ Website Agent Server 是一个 Python 服务端浏览器代理。客户端不会
 - 目标网站运行在服务器端的浏览器上下文中。
 - 客户端只接收该浏览器视口的 JPEG 截图帧。
 - 用户操作由服务器转发并在 Chromium 中重放。
-- 输入法文本、粘贴、复制、剪切、下载和文件选择通过本服务器接口中转。
+- 输入法文本、粘贴、复制、剪切、下载、文件选择和 Cookie 管理通过本服务器接口中转。
 
 因为远程页面不会以 HTML 形式嵌入客户端，所以页面脚本、链接点击、图片、XHR/fetch 请求、WebSocket 连接和表单提交都由服务器端浏览器完成。
 
@@ -31,7 +31,7 @@ venv\Scripts\python.exe -m playwright install chromium
 venv\Scripts\python.exe -m website_agent_server
 ```
 
-打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)，输入目标网站 URL，然后在渲染视口中操作远程网站。
+打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)，输入目标网站 URL，然后在渲染视口中操作远程网站。服务默认监听所有网卡，所以局域网客户端也可以用服务器机器的局域网 IP 连接。
 
 ## 命令行配置
 
@@ -47,8 +47,7 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--host` | `127.0.0.1` | 服务监听地址。 |
-| `--allow-lan` | 禁用 | 允许局域网客户端访问；如果没有设置 `--host`，会监听 `0.0.0.0`。 |
+| `--host` | `0.0.0.0` | 服务监听地址。如果只想允许本机访问，使用 `127.0.0.1`。 |
 | `--port` | `8000` | 服务端口。 |
 | `--headed` | 禁用 | 使用可见浏览器窗口运行 Chromium。 |
 | `--ignore-https-errors` | 禁用 | 忽略远程 TLS 证书错误。 |
@@ -63,13 +62,20 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | `--max-viewport-height` | `1600` | 最大远程视口高度。 |
 | `--data-dir` | `.agent-data` | 运行时下载和临时上传目录。 |
 | `--pin` | 禁用 | 要求用户提供该 PIN 后才能访问代理 UI、API 和 WebSocket。 |
+| `--lock-url` | 禁用 | 自动打开该 URL，并隐藏/禁用 Back、Forward、Cookie、Quit 和地址导航等浏览器选项控件。如果配置了 PIN，认证仍然生效。 |
 
 默认会阻止私有和本地网络目标，以降低 SSRF 风险。只有在你信任所有能访问该代理的用户时，才建议使用 `--allow-private-hosts`。
 
-如果要暴露给局域网，建议同时设置 PIN：
+因为默认允许局域网访问，建议同时设置 PIN：
 
 ```powershell
-venv\Scripts\python.exe -m website_agent_server --allow-lan --pin 123456
+venv\Scripts\python.exe -m website_agent_server --pin 123456
+```
+
+如果代理本身也需要打开局域网或本机目标 URL，需要显式允许私有目标：
+
+```powershell
+venv\Scripts\python.exe -m website_agent_server --allow-private-hosts --pin 123456
 ```
 
 ## 限制

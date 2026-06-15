@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import WebSocket
@@ -44,6 +45,14 @@ def _clamp(value: int, minimum: int, maximum: int) -> int:
 class DownloadRecord:
     filename: str
     path: Path
+
+
+def _cookie_identity(cookie: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(cookie.get("name") or ""),
+        str(cookie.get("domain") or ""),
+        str(cookie.get("path") or "/"),
+    )
 
 
 class BrowserSession:
@@ -149,18 +158,60 @@ class BrowserSession:
     def get_download(self, token: str) -> DownloadRecord | None:
         return self.downloads.get(token)
 
+    async def list_cookies(self) -> list[dict[str, Any]]:
+        context = self._require_context()
+        page = self._require_page()
+        self.last_activity = time.monotonic()
+        async with self._action_lock:
+            return await context.cookies([page.url])
+
+    async def replace_cookies(self, cookies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        context = self._require_context()
+        page = self._require_page()
+        self.last_activity = time.monotonic()
+        async with self._action_lock:
+            page_url = page.url
+            existing = await context.cookies([page_url])
+            normalized = [self._normalize_cookie(cookie, page_url) for cookie in cookies]
+            if normalized:
+                await context.add_cookies(normalized)
+            next_keys = {_cookie_identity(cookie) for cookie in normalized}
+            for cookie in existing:
+                if _cookie_identity(cookie) not in next_keys:
+                    await context.clear_cookies(
+                        name=str(cookie.get("name") or ""),
+                        domain=str(cookie.get("domain") or ""),
+                        path=str(cookie.get("path") or "/"),
+                    )
+            return await context.cookies([page_url])
+
     async def handle_message(self, payload: dict[str, Any]) -> None:
         self.last_activity = time.monotonic()
         message_type = payload.get("type")
         if message_type == "resize":
             await self._resize(int(payload.get("width", self.viewport_width)), int(payload.get("height", self.viewport_height)))
         elif message_type == "navigate":
+            if self.settings.lock_url is not None:
+                await self._queue_message(
+                    {"type": "warning", "message": "Options are locked by the server."}
+                )
+                return
             await self.navigate(str(payload.get("url", "")))
         elif message_type == "reload":
             await self._reload()
         elif message_type == "back":
+            if self.settings.lock_url is not None:
+                await self._queue_message(
+                    {"type": "warning", "message": "Options are locked by the server."}
+                )
+                return
             await self._go_back()
         elif message_type == "forward":
+            if self.settings.lock_url is not None:
+                await self._queue_message(
+                    {"type": "warning", "message": "Options are locked by the server."}
+                )
+                return
             await self._go_forward()
         elif message_type == "mouse_move":
             await self._mouse_move(payload)
@@ -611,6 +662,42 @@ class BrowserSession:
         if self.page is None or self.page.is_closed():
             raise RuntimeError("Browser page is not available.")
         return self.page
+
+    def _require_context(self) -> BrowserContext:
+        if self.context is None:
+            raise RuntimeError("Browser context is not available.")
+        return self.context
+
+    def _normalize_cookie(self, cookie: dict[str, Any], page_url: str) -> dict[str, Any]:
+        name = str(cookie.get("name") or "").strip()
+        if not name:
+            raise ValueError("Cookie name is required.")
+        path = str(cookie.get("path") or "/").strip() or "/"
+        domain = str(cookie.get("domain") or "").strip()
+        if not domain:
+            host = urlsplit(page_url).hostname
+            if not host:
+                raise ValueError("Cookie domain is required.")
+            domain = host
+
+        normalized: dict[str, Any] = {
+            "name": name,
+            "value": str(cookie.get("value") or ""),
+            "domain": domain,
+            "path": path,
+            "httpOnly": bool(cookie.get("httpOnly", False)),
+            "secure": bool(cookie.get("secure", False)),
+        }
+        expires = cookie.get("expires")
+        if isinstance(expires, (int, float)) and expires > 0:
+            normalized["expires"] = float(expires)
+        same_site = cookie.get("sameSite")
+        if same_site in {"Lax", "None", "Strict"}:
+            normalized["sameSite"] = same_site
+        partition_key = cookie.get("partitionKey")
+        if isinstance(partition_key, str) and partition_key:
+            normalized["partitionKey"] = partition_key
+        return normalized
 
 
 class BrowserManager:

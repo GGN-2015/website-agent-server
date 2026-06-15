@@ -9,6 +9,9 @@ const state = {
   lastRemoteClipboard: "",
   writingClipboard: false,
   pendingClipboard: "",
+  quitting: false,
+  locked: false,
+  lockUrl: "",
 };
 window.websiteAgentState = state;
 
@@ -16,16 +19,29 @@ const launcher = document.getElementById("launcher");
 const launchForm = document.getElementById("launch-form");
 const launchError = document.getElementById("launch-error");
 const targetUrl = document.getElementById("target-url");
+const toolbar = document.querySelector(".toolbar");
+const lockedMessage = document.getElementById("locked-message");
 const addressForm = document.getElementById("address-form");
 const addressInput = document.getElementById("address-input");
 const backButton = document.getElementById("back-button");
 const forwardButton = document.getElementById("forward-button");
 const reloadButton = document.getElementById("reload-button");
+const cookieButton = document.getElementById("cookie-button");
+const quitButton = document.getElementById("quit-button");
 const goButton = document.getElementById("go-button");
 const statusText = document.getElementById("status-text");
 const viewportWrap = document.getElementById("viewport-wrap");
 const canvas = document.getElementById("viewport");
 const inputProxy = document.getElementById("input-proxy");
+const cookieDialog = document.getElementById("cookie-dialog");
+const cookieSummary = document.getElementById("cookie-summary");
+const cookieError = document.getElementById("cookie-error");
+const cookieList = document.getElementById("cookie-list");
+const cookieCount = document.getElementById("cookie-count");
+const cookieCloseButton = document.getElementById("cookie-close-button");
+const cookieCancelButton = document.getElementById("cookie-cancel-button");
+const cookieAddButton = document.getElementById("cookie-add-button");
+const cookieSaveButton = document.getElementById("cookie-save-button");
 const context = canvas.getContext("2d", { alpha: false });
 
 function setStatus(text) {
@@ -33,10 +49,22 @@ function setStatus(text) {
 }
 
 function setControlsEnabled(enabled) {
+  if (state.locked) {
+    addressInput.disabled = true;
+    backButton.disabled = true;
+    forwardButton.disabled = true;
+    reloadButton.disabled = true;
+    cookieButton.disabled = true;
+    quitButton.disabled = true;
+    goButton.disabled = true;
+    return;
+  }
   addressInput.disabled = !enabled;
   backButton.disabled = !enabled;
   forwardButton.disabled = !enabled;
   reloadButton.disabled = !enabled;
+  cookieButton.disabled = !enabled;
+  quitButton.disabled = !enabled;
   goButton.disabled = !enabled;
 }
 
@@ -46,6 +74,30 @@ function measureViewport() {
     width: Math.max(320, Math.min(1920, Math.floor(rect.width || 1280))),
     height: Math.max(240, Math.min(1600, Math.floor(rect.height || 720))),
   };
+}
+
+async function loadClientConfig() {
+  const response = await fetch("/api/config");
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(body.detail || "Could not load server configuration.");
+  }
+  state.locked = Boolean(body.locked);
+  state.lockUrl = body.lock_url || "";
+}
+
+function applyLockedMode() {
+  toolbar.classList.toggle("locked", state.locked);
+  document.body.classList.toggle("locked", state.locked);
+  lockedMessage.hidden = !state.locked;
+  if (state.locked) {
+    launcher.hidden = true;
+    addressInput.value = state.lockUrl;
+    setControlsEnabled(false);
+  } else if (!state.sessionId) {
+    launcher.hidden = false;
+    targetUrl.focus();
+  }
 }
 
 async function createSession(url) {
@@ -83,8 +135,49 @@ function connectSession(sessionId) {
   socket.addEventListener("close", () => {
     state.connected = false;
     setControlsEnabled(false);
-    setStatus("Disconnected");
+    if (!state.quitting && state.sessionId) {
+      setStatus("Disconnected");
+    }
   });
+}
+
+function resetViewport() {
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width || 1, canvas.height || 1);
+}
+
+async function quitSession() {
+  if (state.locked) {
+    return;
+  }
+  const sessionId = state.sessionId;
+  if (!sessionId) {
+    return;
+  }
+  closeCookieDialog(false);
+  setControlsEnabled(false);
+  state.quitting = true;
+  setStatus("Closing");
+  if (state.socket) {
+    state.socket.close();
+    state.socket = null;
+  }
+  state.connected = false;
+  state.sessionId = null;
+  try {
+    await fetch(`/api/sessions/${sessionId}/close`, { method: "POST" });
+  } catch {
+    // The browser session may already be gone.
+  }
+  resetViewport();
+  addressInput.value = "";
+  launchError.textContent = "";
+  launcher.hidden = state.locked;
+  state.quitting = false;
+  setStatus("Idle");
+  if (!state.locked) {
+    targetUrl.focus();
+  }
 }
 
 function handleServerMessage(message) {
@@ -131,6 +224,12 @@ function drawFrame(message) {
 }
 
 function send(message) {
+  if (
+    state.locked &&
+    (message.type === "navigate" || message.type === "back" || message.type === "forward")
+  ) {
+    return;
+  }
   if (!state.connected || !state.socket || state.socket.readyState !== WebSocket.OPEN) {
     return;
   }
@@ -190,6 +289,9 @@ function pointerButton(event) {
 
 launchForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (state.locked) {
+    return;
+  }
   launchError.textContent = "";
   setStatus("Opening");
   const submitButton = launchForm.querySelector("button");
@@ -210,6 +312,9 @@ launchForm.addEventListener("submit", async (event) => {
 
 addressForm.addEventListener("submit", (event) => {
   event.preventDefault();
+  if (state.locked) {
+    return;
+  }
   send({ type: "navigate", url: addressInput.value });
   focusInputProxy();
 });
@@ -217,6 +322,302 @@ addressForm.addEventListener("submit", (event) => {
 backButton.addEventListener("click", () => send({ type: "back" }));
 forwardButton.addEventListener("click", () => send({ type: "forward" }));
 reloadButton.addEventListener("click", () => send({ type: "reload" }));
+cookieButton.addEventListener("click", () => {
+  if (state.locked) {
+    return;
+  }
+  openCookieDialog();
+});
+quitButton.addEventListener("click", () => {
+  quitSession();
+});
+
+cookieCloseButton.addEventListener("click", () => closeCookieDialog());
+cookieCancelButton.addEventListener("click", () => closeCookieDialog());
+cookieAddButton.addEventListener("click", () => {
+  const host = cookieDefaultDomain();
+  addCookieRow({
+    name: "",
+    value: "",
+    domain: host,
+    path: "/",
+    expires: null,
+    httpOnly: false,
+    secure: cookieDefaultSecure(),
+    sameSite: "Lax",
+  });
+  updateCookieCount();
+  const lastRow = cookieList.querySelector(".cookie-row:last-child");
+  const nameInput = lastRow ? lastRow.querySelector("[data-field='name']") : null;
+  if (nameInput) {
+    nameInput.focus();
+  }
+});
+cookieSaveButton.addEventListener("click", () => {
+  saveCookies();
+});
+cookieDialog.addEventListener("click", (event) => {
+  if (event.target === cookieDialog) {
+    closeCookieDialog();
+  }
+});
+
+function cookieDefaultDomain() {
+  try {
+    return new URL(addressInput.value).hostname || "";
+  } catch {
+    return "";
+  }
+}
+
+function cookieDefaultSecure() {
+  try {
+    return new URL(addressInput.value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function setCookieBusy(busy) {
+  cookieAddButton.disabled = busy;
+  cookieSaveButton.disabled = busy;
+  cookieCancelButton.disabled = busy;
+  cookieCloseButton.disabled = busy;
+  for (const control of cookieList.querySelectorAll("input, select, button")) {
+    control.disabled = busy;
+  }
+}
+
+function openCookieDialog() {
+  if (state.locked || !state.sessionId) {
+    return;
+  }
+  cookieDialog.hidden = false;
+  cookieSummary.textContent = addressInput.value || "Current page";
+  cookieError.textContent = "";
+  cookieList.replaceChildren();
+  const empty = document.createElement("div");
+  empty.className = "cookie-empty";
+  empty.textContent = "Loading cookies...";
+  cookieList.append(empty);
+  updateCookieCount();
+  loadCookies();
+}
+
+function closeCookieDialog(restoreFocus = true) {
+  if (cookieDialog.hidden) {
+    return;
+  }
+  cookieDialog.hidden = true;
+  cookieError.textContent = "";
+  if (restoreFocus) {
+    focusInputProxy();
+  }
+}
+
+async function loadCookies() {
+  if (!state.sessionId) {
+    return;
+  }
+  setCookieBusy(true);
+  try {
+    const response = await fetch(`/api/sessions/${state.sessionId}/cookies`);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body.detail || "Could not load cookies.");
+    }
+    cookieList.replaceChildren();
+    for (const cookie of body.cookies || []) {
+      addCookieRow(cookie);
+    }
+    if (!cookieList.children.length) {
+      showEmptyCookies("No cookies for this page.");
+    }
+    updateCookieCount();
+    cookieSummary.textContent = addressInput.value || "Current page";
+  } catch (error) {
+    cookieError.textContent = error.message;
+    showEmptyCookies("Cookies are unavailable.");
+  } finally {
+    setCookieBusy(false);
+  }
+}
+
+function showEmptyCookies(text) {
+  cookieList.replaceChildren();
+  const empty = document.createElement("div");
+  empty.className = "cookie-empty";
+  empty.textContent = text;
+  cookieList.append(empty);
+  updateCookieCount();
+}
+
+function addCookieRow(cookie) {
+  const empty = cookieList.querySelector(".cookie-empty");
+  if (empty) {
+    empty.remove();
+  }
+  const row = document.createElement("div");
+  row.className = "cookie-row";
+  if (typeof cookie.expires === "number" && cookie.expires > 0) {
+    row.dataset.expires = String(cookie.expires);
+  }
+  if (cookie.partitionKey) {
+    row.dataset.partitionKey = cookie.partitionKey;
+  }
+  row.append(
+    createCookieTextField("Name", "name", cookie.name || ""),
+    createCookieTextField("Value", "value", cookie.value || ""),
+    createCookieTextField("Domain", "domain", cookie.domain || cookieDefaultDomain()),
+    createCookieTextField("Path", "path", cookie.path || "/"),
+    createSameSiteField(cookie.sameSite || "Lax"),
+    createCookieFlags(cookie),
+    createCookieRemoveButton()
+  );
+  cookieList.append(row);
+}
+
+function createCookieTextField(labelText, field, value) {
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.dataset.field = field;
+  input.value = value;
+  input.spellcheck = false;
+  label.append(input);
+  return label;
+}
+
+function createSameSiteField(value) {
+  const label = document.createElement("label");
+  label.textContent = "SameSite";
+  const select = document.createElement("select");
+  select.dataset.field = "sameSite";
+  for (const optionValue of ["Lax", "Strict", "None"]) {
+    const option = document.createElement("option");
+    option.value = optionValue;
+    option.textContent = optionValue;
+    select.append(option);
+  }
+  select.value = ["Lax", "Strict", "None"].includes(value) ? value : "Lax";
+  label.append(select);
+  return label;
+}
+
+function createCookieFlags(cookie) {
+  const flags = document.createElement("div");
+  flags.className = "cookie-flags";
+  flags.append(
+    createCookieCheckbox("Secure", "secure", Boolean(cookie.secure)),
+    createCookieCheckbox("HttpOnly", "httpOnly", Boolean(cookie.httpOnly))
+  );
+  return flags;
+}
+
+function createCookieCheckbox(labelText, field, checked) {
+  const label = document.createElement("label");
+  label.className = "cookie-flag";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.dataset.field = field;
+  input.checked = checked;
+  label.append(input, document.createTextNode(labelText));
+  return label;
+}
+
+function createCookieRemoveButton() {
+  const button = document.createElement("button");
+  button.className = "cookie-remove-button";
+  button.type = "button";
+  button.title = "Delete";
+  button.setAttribute("aria-label", "Delete cookie");
+  button.textContent = "x";
+  button.addEventListener("click", () => {
+    button.closest(".cookie-row").remove();
+    if (!cookieList.querySelector(".cookie-row")) {
+      showEmptyCookies("No cookies for this page.");
+    } else {
+      updateCookieCount();
+    }
+  });
+  return button;
+}
+
+function collectCookies() {
+  const cookies = [];
+  const seen = new Set();
+  for (const row of cookieList.querySelectorAll(".cookie-row")) {
+    const name = row.querySelector("[data-field='name']").value.trim();
+    const value = row.querySelector("[data-field='value']").value;
+    const domain = row.querySelector("[data-field='domain']").value.trim();
+    const path = row.querySelector("[data-field='path']").value.trim() || "/";
+    const sameSite = row.querySelector("[data-field='sameSite']").value;
+    const secure = row.querySelector("[data-field='secure']").checked;
+    const httpOnly = row.querySelector("[data-field='httpOnly']").checked;
+    if (!name) {
+      throw new Error("Cookie name is required.");
+    }
+    const key = `${name}\n${domain}\n${path}`;
+    if (seen.has(key)) {
+      throw new Error(`Duplicate cookie: ${name}`);
+    }
+    seen.add(key);
+    const cookie = { name, value, domain, path, sameSite, secure, httpOnly };
+    if (row.dataset.expires) {
+      cookie.expires = Number(row.dataset.expires);
+    }
+    if (row.dataset.partitionKey) {
+      cookie.partitionKey = row.dataset.partitionKey;
+    }
+    cookies.push(cookie);
+  }
+  return cookies;
+}
+
+async function saveCookies() {
+  if (!state.sessionId) {
+    return;
+  }
+  let cookies;
+  try {
+    cookies = collectCookies();
+  } catch (error) {
+    cookieError.textContent = error.message;
+    return;
+  }
+  cookieError.textContent = "";
+  setCookieBusy(true);
+  try {
+    const response = await fetch(`/api/sessions/${state.sessionId}/cookies`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cookies }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body.detail || "Could not save cookies.");
+    }
+    cookieList.replaceChildren();
+    for (const cookie of body.cookies || []) {
+      addCookieRow(cookie);
+    }
+    if (!cookieList.children.length) {
+      showEmptyCookies("No cookies for this page.");
+    }
+    updateCookieCount();
+    setStatus("Cookies saved");
+  } catch (error) {
+    cookieError.textContent = error.message;
+  } finally {
+    setCookieBusy(false);
+  }
+}
+
+function updateCookieCount() {
+  const count = cookieList.querySelectorAll(".cookie-row").length;
+  cookieCount.textContent = count === 1 ? "1 cookie" : `${count} cookies`;
+}
 
 canvas.addEventListener("contextmenu", (event) => event.preventDefault());
 
@@ -449,6 +850,40 @@ window.addEventListener("beforeunload", () => {
     navigator.sendBeacon(`/api/sessions/${state.sessionId}/close`);
   }
 });
+
+async function startLockedSession() {
+  if (!state.lockUrl) {
+    launchError.textContent = "Locked URL is not configured.";
+    setStatus("Idle");
+    return;
+  }
+  setStatus("Opening");
+  try {
+    const session = await createSession(state.lockUrl);
+    state.sessionId = session.session_id;
+    addressInput.value = session.url || state.lockUrl;
+    connectSession(state.sessionId);
+  } catch (error) {
+    setStatus("Error");
+    launchError.textContent = error.message;
+  }
+}
+
+async function initializeApp() {
+  try {
+    await loadClientConfig();
+    applyLockedMode();
+    if (state.locked) {
+      await startLockedSession();
+    }
+  } catch (error) {
+    launcher.hidden = false;
+    launchError.textContent = error.message;
+    setStatus("Idle");
+  }
+}
+
+initializeApp();
 
 function startDownload(message) {
   const link = document.createElement("a");

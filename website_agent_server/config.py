@@ -9,7 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 @dataclass
 class Settings:
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 8000
     headless: bool = True
     ignore_https_errors: bool = False
@@ -24,6 +24,7 @@ class Settings:
     max_viewport_height: int = 1600
     data_dir: Path = PROJECT_ROOT / ".agent-data"
     pin: str | None = None
+    lock_url: str | None = None
     auth_cookie_name: str = "website_agent_auth"
     auth_cookie_max_age: int = 60 * 60 * 24 * 7
 
