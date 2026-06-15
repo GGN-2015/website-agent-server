@@ -54,7 +54,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--screenshot-quality",
         type=int,
         default=settings.screenshot_quality,
-        help="JPEG screenshot quality from 1 to 100.",
+        help="Screenshot quality from 1 to 100. Values below 100 use JPEG; 100 uses PNG.",
+    )
+    parser.add_argument(
+        "--media-frame-interval-seconds",
+        type=float,
+        default=settings.media_frame_interval_seconds,
+        help="Screenshot streaming interval while remote media is playing.",
+    )
+    parser.add_argument(
+        "--media-screenshot-quality",
+        type=int,
+        default=settings.media_screenshot_quality,
+        help="JPEG screenshot quality while remote media is playing. Ignored when screenshot quality is 100.",
     )
     parser.add_argument(
         "--min-viewport-width",
@@ -109,6 +121,8 @@ async def apply_args(args: argparse.Namespace) -> None:
     settings.navigation_timeout_ms = args.navigation_timeout_ms
     settings.frame_interval_seconds = args.frame_interval_seconds
     settings.screenshot_quality = max(1, min(100, args.screenshot_quality))
+    settings.media_frame_interval_seconds = max(0.05, args.media_frame_interval_seconds)
+    settings.media_screenshot_quality = max(1, min(99, args.media_screenshot_quality))
     settings.min_viewport_width = args.min_viewport_width
     settings.min_viewport_height = args.min_viewport_height
     settings.max_viewport_width = args.max_viewport_width

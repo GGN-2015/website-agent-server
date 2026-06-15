@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import struct
 import zlib
 import json
@@ -26,6 +25,7 @@ from playwright.async_api import (
     FileChooser,
     Page,
     Playwright,
+    Request as PlaywrightRequest,
     Route,
     TimeoutError as PlaywrightTimeoutError,
     WebSocketRoute,
@@ -47,6 +47,23 @@ MOBILE_FALLBACK_USER_AGENT = (
 MOBILE_CLIENT_HINT_HEADERS = {
     "sec-ch-ua-mobile": "?1",
     "sec-ch-ua-platform": '"Android"',
+}
+MOUSE_MOVE_MAX_DURATION_SECONDS = 0.1
+MOUSE_MOVE_SPEED_PIXELS_PER_SECOND = 12000.0
+MOUSE_MOVE_STEP_INTERVAL_SECONDS = 0.008
+MOUSE_MOVE_STEP_DISTANCE = 42.0
+MOUSE_MOVE_MAX_STEPS = 16
+MAX_AUDIO_CHUNK_BASE64_LENGTH = 2_000_000
+FORCE_RELOAD_NO_CACHE_SECONDS = 20.0
+INTERACTION_FRAME_MESSAGE_TYPES = {
+    "mouse_down",
+    "mouse_up",
+    "tap",
+    "wheel",
+    "pinch",
+    "key",
+    "text",
+    "paste",
 }
 
 NATIVE_CARET_SUPPRESSION_SCRIPT = """() => {
@@ -132,6 +149,281 @@ NATIVE_CARET_SUPPRESSION_SCRIPT = """() => {
     }
 }"""
 NATIVE_CARET_SUPPRESSION_INIT_SCRIPT = f"({NATIVE_CARET_SUPPRESSION_SCRIPT})()"
+
+AUDIO_CAPTURE_SCRIPT = """() => {
+    if (window.__websiteAgentAudioCaptureInstalled) {
+        return;
+    }
+    window.__websiteAgentAudioCaptureInstalled = true;
+    if (
+        typeof window.__websiteAgentAudioBridge !== "function" ||
+        typeof MediaRecorder === "undefined" ||
+        typeof MediaStream === "undefined"
+    ) {
+        return;
+    }
+    const mimeType = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+    ].find((candidate) => MediaRecorder.isTypeSupported(candidate));
+    if (!mimeType) {
+        return;
+    }
+
+    const records = new WeakMap();
+    let nextStreamId = 1;
+    let audioContextPatched = false;
+
+    function post(message) {
+        try {
+            window.__websiteAgentAudioBridge(message);
+        } catch {
+            // The local bridge may have gone away during navigation.
+        }
+    }
+
+    function bufferToBase64(buffer) {
+        const bytes = new Uint8Array(buffer);
+        let binary = "";
+        const size = 0x8000;
+        for (let offset = 0; offset < bytes.length; offset += size) {
+            const chunk = bytes.subarray(offset, offset + size);
+            binary += String.fromCharCode(...chunk);
+        }
+        return btoa(binary);
+    }
+
+    function eligible(element) {
+        return (
+            element instanceof HTMLMediaElement &&
+            !element.paused &&
+            !element.ended &&
+            !element.muted &&
+            element.volume > 0
+        );
+    }
+
+    function ensureRecord(element, streamFactory) {
+        if (!(element instanceof HTMLMediaElement)) {
+            return null;
+        }
+        let record = records.get(element);
+        if (record) {
+            return record;
+        }
+        let stream;
+        try {
+            stream = streamFactory(element);
+        } catch {
+            return null;
+        }
+        if (!stream || typeof stream.getAudioTracks !== "function") {
+            return null;
+        }
+        record = {
+            stream,
+            recorder: null,
+            streamId: `media-${Date.now()}-${nextStreamId++}`,
+            watched: false,
+        };
+        records.set(element, record);
+        stream.addEventListener("addtrack", () => {
+            window.setTimeout(() => startRecording(element), 0);
+        });
+        return record;
+    }
+
+    function stopRecording(element) {
+        const record = records.get(element);
+        if (!record || !record.recorder) {
+            return;
+        }
+        const recorder = record.recorder;
+        record.recorder = null;
+        try {
+            if (recorder.state !== "inactive") {
+                recorder.stop();
+            }
+        } catch {
+            post({ kind: "stop", streamId: record.streamId });
+        }
+    }
+
+    function startRecording(element) {
+        if (!eligible(element)) {
+            stopRecording(element);
+            return;
+        }
+        let record = records.get(element);
+        if (!record) {
+            if (typeof element.captureStream !== "function") {
+                post({ kind: "debug", reason: "capture-stream-unavailable" });
+                return;
+            }
+            record = ensureRecord(element, (mediaElement) => mediaElement.captureStream());
+        }
+        if (!record || (record.recorder && record.recorder.state !== "inactive")) {
+            return;
+        }
+        const tracks = record.stream
+            .getAudioTracks()
+            .filter((track) => track.readyState === "live");
+        if (tracks.length === 0) {
+            post({ kind: "debug", streamId: record.streamId, reason: "no-live-audio-tracks" });
+            return;
+        }
+        let recorder;
+        try {
+            recorder = new MediaRecorder(new MediaStream(tracks), { mimeType });
+        } catch {
+            return;
+        }
+        record.recorder = recorder;
+        recorder.addEventListener("start", () => {
+            post({ kind: "start", streamId: record.streamId, mime: mimeType });
+        });
+        recorder.addEventListener("stop", () => {
+            post({ kind: "stop", streamId: record.streamId });
+        });
+        recorder.addEventListener("dataavailable", async (event) => {
+            if (!event.data || event.data.size <= 0) {
+                return;
+            }
+            try {
+                const buffer = await event.data.arrayBuffer();
+                post({
+                    kind: "chunk",
+                    streamId: record.streamId,
+                    mime: recorder.mimeType || mimeType,
+                    data: bufferToBase64(buffer),
+                });
+            } catch {
+                // Dropping one audio chunk is better than breaking page playback.
+            }
+        });
+        try {
+            recorder.start(500);
+        } catch {
+            post({ kind: "debug", streamId: record.streamId, reason: "recorder-start-failed" });
+            record.recorder = null;
+        }
+    }
+
+    function watchMediaElement(element) {
+        if (!(element instanceof HTMLMediaElement)) {
+            return;
+        }
+        if (typeof element.captureStream !== "function") {
+            post({ kind: "debug", reason: "capture-stream-unavailable" });
+            return;
+        }
+        const record = ensureRecord(element, (mediaElement) => mediaElement.captureStream());
+        if (!record || record.watched) {
+            return;
+        }
+        record.watched = true;
+        element.addEventListener("play", () => startRecording(element), true);
+        element.addEventListener("playing", () => startRecording(element), true);
+        element.addEventListener("canplay", () => startRecording(element), true);
+        element.addEventListener("volumechange", () => startRecording(element), true);
+        element.addEventListener("pause", () => stopRecording(element), true);
+        element.addEventListener("ended", () => stopRecording(element), true);
+        element.addEventListener("emptied", () => stopRecording(element), true);
+        startRecording(element);
+    }
+
+    function startRecordingFromStream(element, stream) {
+        if (!(element instanceof HTMLMediaElement) || !stream) {
+            return;
+        }
+        let record = records.get(element);
+        if (!record) {
+            record = {
+                stream,
+                recorder: null,
+                streamId: `media-${Date.now()}-${nextStreamId++}`,
+                watched: true,
+            };
+            records.set(element, record);
+        } else if (!record.stream || record.stream.getAudioTracks().length === 0) {
+            record.stream = stream;
+        }
+        stream.addEventListener("addtrack", () => {
+            window.setTimeout(() => startRecording(element), 0);
+        });
+        window.setTimeout(() => startRecording(element), 0);
+    }
+
+    function patchAudioContextClass(ContextClass) {
+        if (!ContextClass || ContextClass.prototype.__websiteAgentAudioPatched) {
+            return;
+        }
+        Object.defineProperty(ContextClass.prototype, "__websiteAgentAudioPatched", {
+            value: true,
+            configurable: true,
+        });
+        const original = ContextClass.prototype.createMediaElementSource;
+        if (typeof original !== "function") {
+            return;
+        }
+        ContextClass.prototype.createMediaElementSource = function (element) {
+            const source = original.call(this, element);
+            try {
+                const destination = this.createMediaStreamDestination();
+                source.connect(destination);
+                startRecordingFromStream(element, destination.stream);
+            } catch {
+                // Fall back to captureStream.
+            }
+            return source;
+        };
+    }
+
+    function patchAudioContext() {
+        if (audioContextPatched) {
+            return;
+        }
+        audioContextPatched = true;
+        patchAudioContextClass(window.AudioContext);
+        patchAudioContextClass(window.webkitAudioContext);
+    }
+
+    const originalPlay = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function (...args) {
+        patchAudioContext();
+        watchMediaElement(this);
+        const result = originalPlay.apply(this, args);
+        if (result && typeof result.then === "function") {
+            result.then(() => startRecording(this)).catch(() => {});
+        } else {
+            window.setTimeout(() => startRecording(this), 0);
+        }
+        return result;
+    };
+
+    function scan(root) {
+        if (!root || !root.querySelectorAll) {
+            return;
+        }
+        if (root instanceof HTMLMediaElement) {
+            watchMediaElement(root);
+        }
+        root.querySelectorAll("audio, video").forEach(watchMediaElement);
+    }
+
+    patchAudioContext();
+    scan(document);
+    new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+            for (const node of mutation.addedNodes) {
+                if (node instanceof Element) {
+                    scan(node);
+                }
+            }
+        }
+    }).observe(document.documentElement, { childList: true, subtree: true });
+}"""
+AUDIO_CAPTURE_INIT_SCRIPT = f"({AUDIO_CAPTURE_SCRIPT})()"
 
 EDITABLE_METRICS_SCRIPT = """() => {
     const textTypes = new Set([
@@ -569,9 +861,18 @@ class BrowserSession:
         self._mobile_focus_zoom = 1.0
         self._mobile_focus_clip: dict[str, float] | None = None
         self._calibrate_caret_until = 0.0
+        self._mouse_position: tuple[float, float] = (0.0, 0.0)
+        self._pending_document_navigation_url = ""
+        self._force_reload_until = 0.0
+        self._media_state_checked_at = 0.0
+        self._media_playing = False
         self._action_lock = asyncio.Lock()
+        self._frame_capture_lock = asyncio.Lock()
+        self._requested_frame_task: asyncio.Task[None] | None = None
         self._outgoing: asyncio.Queue[dict[str, Any]] | None = None
+        self._audio_outgoing: asyncio.Queue[dict[str, Any]] | None = None
         self._websocket: WebSocket | None = None
+        self._audio_websocket: WebSocket | None = None
         self._closed = False
         self._connected = False
         self.disconnected_at = time.monotonic()
@@ -622,13 +923,22 @@ class BrowserSession:
         context = self.context
         page = self.page
         websocket = self._websocket
+        audio_websocket = self._audio_websocket
         self.context = None
         self.page = None
         self._websocket = None
+        self._audio_websocket = None
         self._outgoing = None
+        self._audio_outgoing = None
         self._connected = False
+        requested_frame_task = self._requested_frame_task
+        self._requested_frame_task = None
+        if requested_frame_task is not None:
+            requested_frame_task.cancel()
         if websocket is not None:
             await _ignore_shutdown_disconnect(websocket.close(code=1001))
+        if audio_websocket is not None:
+            await _ignore_shutdown_disconnect(audio_websocket.close(code=1001))
         pages_to_close = self._session_pages(page)
         for session_page in pages_to_close:
             await _ignore_shutdown_disconnect(session_page.close())
@@ -662,7 +972,7 @@ class BrowserSession:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             for task in done:
                 exc = task.exception()
-                if exc and not isinstance(exc, WebSocketDisconnect):
+                if exc and not isinstance(exc, WebSocketDisconnect) and not _is_websocket_disconnect(exc):
                     raise exc
             for task in pending:
                 task.cancel()
@@ -681,6 +991,38 @@ class BrowserSession:
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    async def connect_audio(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=48)
+        previous_websocket = self._audio_websocket
+        if previous_websocket is not None:
+            await _ignore_shutdown_disconnect(
+                previous_websocket.close(code=1001, reason="Reconnected")
+            )
+        self.last_activity = time.monotonic()
+        self._audio_outgoing = outgoing
+        self._audio_websocket = websocket
+        send_task = asyncio.create_task(self._send_loop(websocket, outgoing))
+        receive_task = asyncio.create_task(self._audio_receive_loop(websocket))
+        tasks = {send_task, receive_task}
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            for task in done:
+                exc = task.exception()
+                if exc and not isinstance(exc, WebSocketDisconnect) and not _is_websocket_disconnect(exc):
+                    raise exc
+            for task in pending:
+                task.cancel()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            for task in tasks:
+                task.cancel()
+            if self._audio_outgoing is outgoing:
+                self._audio_outgoing = None
+            if self._audio_websocket is websocket:
+                self._audio_websocket = None
 
     async def navigate(self, raw_url: str) -> None:
         page = self._require_page()
@@ -707,11 +1049,16 @@ class BrowserSession:
                 )
         await self._queue_message(self._status_message("ready"))
 
-    async def upload_file_chooser(self, token: str, paths: list[Path]) -> None:
+    async def upload_file_chooser(
+        self, token: str, files: list[Path] | list[dict[str, object]]
+    ) -> None:
         chooser = self.file_choosers.pop(token, None)
         if chooser is None:
             raise KeyError("File chooser is no longer available.")
-        await chooser.set_files([str(path) for path in paths])
+        if files and isinstance(files[0], Path):
+            await chooser.set_files([str(path) for path in files])
+        else:
+            await chooser.set_files(files)
         await self._queue_message({"type": "status", "state": "files-selected"})
 
     def get_download(self, token: str) -> DownloadRecord | None:
@@ -799,14 +1146,18 @@ class BrowserSession:
             await self.copy_selection(cut=False)
         elif message_type == "cut":
             await self.copy_selection(cut=True)
+        if message_type in INTERACTION_FRAME_MESSAGE_TYPES:
+            self._request_frame_soon()
 
     async def _prepare_page(self, page: Page) -> None:
         await page.set_viewport_size({"width": self.viewport_width, "height": self.viewport_height})
         await page.add_init_script(NATIVE_CARET_SUPPRESSION_INIT_SCRIPT)
+        await page.add_init_script(AUDIO_CAPTURE_INIT_SCRIPT)
         await page.route("**/*", self._guard_route)
         await page.route_web_socket("**/*", self._guard_websocket)
         await self._attach_page(page)
         await self._suppress_native_caret(page)
+        await self._install_audio_capture(page)
 
     async def _attach_page(self, page: Page) -> None:
         self.page = page
@@ -814,13 +1165,22 @@ class BrowserSession:
         page.on("download", lambda download: asyncio.create_task(self._on_download(download)))
         page.on("filechooser", lambda chooser: asyncio.create_task(self._on_filechooser(chooser)))
         page.on("dialog", lambda dialog: asyncio.create_task(self._on_dialog(dialog)))
+        page.on("request", lambda request: asyncio.create_task(self._on_request(request)))
+        page.on("requestfailed", lambda request: asyncio.create_task(self._on_request_failed(request)))
         page.on("framenavigated", lambda frame: asyncio.create_task(self._on_frame_navigated(frame)))
 
     async def _guard_route(self, route: Route) -> None:
         url = route.request.url
         try:
             await self.policy.ensure_request_url_allowed(url)
-            await route.continue_()
+            if time.monotonic() < self._force_reload_until:
+                headers = dict(route.request.headers)
+                headers["cache-control"] = "no-cache"
+                headers["pragma"] = "no-cache"
+                headers["expires"] = "0"
+                await route.continue_(headers=headers)
+            else:
+                await route.continue_()
         except URLPolicyError as exc:
             await route.abort()
             await self._queue_message({"type": "blocked", "url": url, "reason": str(exc)})
@@ -839,6 +1199,37 @@ class BrowserSession:
             await page.evaluate(NATIVE_CARET_SUPPRESSION_SCRIPT)
         except Exception:
             return
+
+    async def _install_audio_capture(self, page: Page) -> None:
+        try:
+            await page.evaluate(AUDIO_CAPTURE_SCRIPT)
+        except Exception:
+            return
+
+    async def handle_audio_bridge_message(self, message: Any) -> None:
+        if not isinstance(message, dict):
+            return
+        kind = str(message.get("kind") or "")
+        if kind == "debug":
+            reason = str(message.get("reason") or "unknown")
+            await self._queue_message({"type": "warning", "message": f"Audio capture: {reason}"})
+            return
+        if kind not in {"start", "chunk", "stop"}:
+            return
+        payload: dict[str, Any] = {
+            "type": "audio",
+            "kind": kind,
+            "streamId": str(message.get("streamId") or "media"),
+        }
+        mime = message.get("mime")
+        if isinstance(mime, str) and mime:
+            payload["mime"] = mime
+        data = message.get("data")
+        if kind == "chunk":
+            if not isinstance(data, str) or len(data) > MAX_AUDIO_CHUNK_BASE64_LENGTH:
+                return
+            payload["data"] = data
+        await self._queue_audio(payload)
 
     async def _on_popup(self, popup: Page) -> None:
         await self._prepare_page(popup)
@@ -875,9 +1266,34 @@ class BrowserSession:
         await dialog.accept(default_value)
         await self._queue_message({"type": "dialog", "dialogType": dialog_type, "message": message})
 
+    async def _on_request(self, request: PlaywrightRequest) -> None:
+        page = self.page
+        if page is None or request.frame != page.main_frame:
+            return
+        if request.resource_type != "document":
+            return
+        url = request.url
+        if not url or url == "about:blank" or url == self._pending_document_navigation_url:
+            return
+        self._pending_document_navigation_url = url
+        self._clear_mobile_focus_zoom()
+        await self._queue_message({"type": "status", "state": "loading", "url": url})
+
+    async def _on_request_failed(self, request: PlaywrightRequest) -> None:
+        page = self.page
+        if page is None or request.frame != page.main_frame:
+            return
+        if request.resource_type != "document":
+            return
+        if request.url != self._pending_document_navigation_url:
+            return
+        self._pending_document_navigation_url = ""
+        await self._queue_message(self._status_message("ready"))
+
     async def _on_frame_navigated(self, frame: Any) -> None:
         page = self.page
         if page is not None and frame == page.main_frame:
+            self._pending_document_navigation_url = ""
             self._clear_mobile_focus_zoom()
             self._record_navigation(page, page.url)
             await self._queue_message(self._status_message("ready"))
@@ -940,11 +1356,32 @@ class BrowserSession:
     ) -> None:
         while True:
             message = await outgoing.get()
+            if message.get("type") == "frame":
+                image = message.get("image", b"")
+                if isinstance(image, bytes):
+                    header = {key: value for key, value in message.items() if key != "image"}
+                    await websocket.send_text(json.dumps(header, separators=(",", ":")))
+                    await websocket.send_bytes(image)
+                    continue
             await websocket.send_text(json.dumps(message, separators=(",", ":")))
+
+    async def _audio_receive_loop(self, websocket: WebSocket) -> None:
+        while True:
+            try:
+                await websocket.receive_text()
+            except RuntimeError as exc:
+                if _is_websocket_disconnect(exc):
+                    raise WebSocketDisconnect() from exc
+                raise
 
     async def _receive_loop(self, websocket: WebSocket) -> None:
         while True:
-            text = await websocket.receive_text()
+            try:
+                text = await websocket.receive_text()
+            except RuntimeError as exc:
+                if _is_websocket_disconnect(exc):
+                    raise WebSocketDisconnect() from exc
+                raise
             try:
                 payload = json.loads(text)
             except json.JSONDecodeError:
@@ -961,59 +1398,127 @@ class BrowserSession:
 
     async def _frame_loop(self) -> None:
         while not self._closed:
-            await asyncio.sleep(self.settings.frame_interval_seconds)
+            await asyncio.sleep(await self._current_frame_interval())
             await self._send_current_frame()
 
+    async def _current_frame_interval(self) -> float:
+        if await self._is_media_playing():
+            return max(self.settings.frame_interval_seconds, self.settings.media_frame_interval_seconds)
+        return self.settings.frame_interval_seconds
+
+    async def _is_media_playing(self) -> bool:
+        now = time.monotonic()
+        if now - self._media_state_checked_at < 0.75:
+            return self._media_playing
+        self._media_state_checked_at = now
+        page = self.page
+        if page is None or page.is_closed():
+            self._media_playing = False
+            return False
+        try:
+            result = await page.evaluate(
+                """() => Array.from(document.querySelectorAll("video, audio")).some((element) => (
+                    element instanceof HTMLMediaElement &&
+                    !element.paused &&
+                    !element.ended &&
+                    element.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+                ))"""
+            )
+        except Exception:
+            self._media_playing = False
+            return False
+        self._media_playing = bool(result)
+        return self._media_playing
+
     async def _send_current_frame(self) -> None:
-        frame = await self._capture_frame()
+        if self._frame_capture_lock.locked():
+            return
+        started_at = time.monotonic()
+        async with self._frame_capture_lock:
+            frame = await self._capture_frame()
         if frame is not None:
             await self._queue_frame(frame)
+        elapsed = time.monotonic() - started_at
+        if elapsed > 0.75:
+            logger.debug(
+                "Slow frame capture for session %s: %.3fs, media_playing=%s, viewport=%sx%s",
+                self.id,
+                elapsed,
+                self._media_playing,
+                self.viewport_width,
+                self.viewport_height,
+            )
+
+    def _request_frame_soon(self) -> None:
+        if self._closed:
+            return
+        if self._requested_frame_task is not None and not self._requested_frame_task.done():
+            return
+        self._requested_frame_task = asyncio.create_task(self._send_delayed_frame())
+
+    async def _send_delayed_frame(self) -> None:
+        try:
+            await asyncio.sleep(0.03)
+            await self._send_current_frame()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
 
     async def _capture_frame(self) -> dict[str, Any] | None:
         page = self.page
         if page is None or page.is_closed():
             return None
         try:
-            async with self._action_lock:
-                caret = await self._editable_caret(page)
-                await self._suppress_native_caret(page)
-                clip = self._mobile_focus_clip
-                focus_zoom_frame = clip is not None
-                screenshot_options: dict[str, Any] = {
-                    "type": "png" if focus_zoom_frame else "jpeg",
-                    "scale": "device" if focus_zoom_frame else "css",
+            caret = await self._editable_caret(page)
+            await self._suppress_native_caret(page)
+            clip = self._mobile_focus_clip
+            focus_zoom_frame = clip is not None
+            lossless_frame = self.settings.screenshot_quality >= 100
+            media_playing = await self._is_media_playing()
+            screenshot_quality = (
+                self.settings.screenshot_quality
+                if lossless_frame or not media_playing
+                else min(self.settings.screenshot_quality, self.settings.media_screenshot_quality)
+            )
+            screenshot_type = "png" if focus_zoom_frame or lossless_frame else "jpeg"
+            screenshot_options: dict[str, Any] = {
+                "type": screenshot_type,
+                "scale": "device" if focus_zoom_frame else "css",
+                "full_page": False,
+                "timeout": 8000,
+            }
+            if screenshot_type == "jpeg":
+                screenshot_options["quality"] = screenshot_quality
+            if clip is not None:
+                screenshot_options["clip"] = clip
+            try:
+                image = await page.screenshot(**screenshot_options)
+            except Exception:
+                if clip is None:
+                    raise
+                self._clear_mobile_focus_zoom()
+                focus_zoom_frame = False
+                screenshot_type = "png" if lossless_frame else "jpeg"
+                screenshot_options = {
+                    "type": screenshot_type,
+                    "scale": "css",
                     "full_page": False,
                     "timeout": 8000,
                 }
-                if not focus_zoom_frame:
-                    screenshot_options["quality"] = self.settings.screenshot_quality
-                if clip is not None:
-                    screenshot_options["clip"] = clip
-                try:
-                    image = await page.screenshot(**screenshot_options)
-                except Exception:
-                    if clip is None:
-                        raise
-                    self._clear_mobile_focus_zoom()
-                    focus_zoom_frame = False
-                    screenshot_options = {
-                        "type": "jpeg",
-                        "quality": self.settings.screenshot_quality,
-                        "scale": "css",
-                        "full_page": False,
-                        "timeout": 8000,
-                    }
-                    image = await page.screenshot(**screenshot_options)
-                title = await page.title()
-                url = page.url
+                if screenshot_type == "jpeg":
+                    screenshot_options["quality"] = screenshot_quality
+                image = await page.screenshot(**screenshot_options)
+            title = await page.title()
+            url = page.url
         except Exception as exc:
             await self._queue_message({"type": "warning", "message": f"Frame capture failed: {exc}"})
             return None
 
         return {
             "type": "frame",
-            "mime": "image/png" if focus_zoom_frame else "image/jpeg",
-            "image": base64.b64encode(image).decode("ascii"),
+            "mime": "image/png" if screenshot_type == "png" else "image/jpeg",
+            "image": image,
             "width": self.viewport_width,
             "height": self.viewport_height,
             "url": url,
@@ -1036,14 +1541,56 @@ class BrowserSession:
     async def _reload(self) -> None:
         self._clear_mobile_focus_zoom()
         page = self._require_page()
+        self.last_activity = time.monotonic()
+        self._force_reload_until = time.monotonic() + FORCE_RELOAD_NO_CACHE_SECONDS
+        await self._queue_message({"type": "status", "state": "loading", "url": page.url})
         async with self._action_lock:
-            await page.reload(wait_until="domcontentloaded", timeout=self.settings.navigation_timeout_ms)
+            client = None
+            try:
+                client = await page.context.new_cdp_session(page)
+                await client.send("Network.enable")
+                await client.send("Network.setCacheDisabled", {"cacheDisabled": True})
+                await client.send("Network.setBypassServiceWorker", {"bypass": True})
+            except Exception:
+                client = None
+
+            try:
+                if client is not None:
+                    await client.send("Page.reload", {"ignoreCache": True})
+                    await page.wait_for_load_state(
+                        "load",
+                        timeout=self.settings.navigation_timeout_ms,
+                    )
+                else:
+                    await page.reload(
+                        wait_until="load",
+                        timeout=self.settings.navigation_timeout_ms,
+                    )
+            except PlaywrightTimeoutError:
+                await self._queue_message(
+                    {
+                        "type": "warning",
+                        "message": "Reload timed out; showing the current browser state.",
+                    }
+                )
+            finally:
+                if client is not None:
+                    await _ignore_shutdown_disconnect(
+                        client.send("Network.setCacheDisabled", {"cacheDisabled": False})
+                    )
+                    await _ignore_shutdown_disconnect(
+                        client.send("Network.setBypassServiceWorker", {"bypass": False})
+                    )
+                    await _ignore_shutdown_disconnect(client.detach())
+        await self._queue_message(self._status_message("ready"))
+        await self._send_current_frame()
 
     async def _go_back(self) -> None:
         self._clear_mobile_focus_zoom()
         if await self._activate_history_delta(-1):
             return
         page = self._require_page()
+        await self._queue_message({"type": "status", "state": "loading", "url": page.url})
         async with self._action_lock:
             try:
                 await page.go_back(
@@ -1057,12 +1604,14 @@ class BrowserSession:
                         "message": "Navigation timed out; showing the current browser state.",
                     }
                 )
+        await self._queue_message(self._status_message("ready"))
 
     async def _go_forward(self) -> None:
         self._clear_mobile_focus_zoom()
         if await self._activate_history_delta(1):
             return
         page = self._require_page()
+        await self._queue_message({"type": "status", "state": "loading", "url": page.url})
         async with self._action_lock:
             try:
                 await page.go_forward(
@@ -1076,6 +1625,7 @@ class BrowserSession:
                         "message": "Navigation timed out; showing the current browser state.",
                     }
                 )
+        await self._queue_message(self._status_message("ready"))
 
     async def _activate_history_delta(self, delta: int) -> bool:
         self._prune_closed_history()
@@ -1113,11 +1663,42 @@ class BrowserSession:
         await self._queue_message(self._status_message("ready"))
         return True
 
+    async def _move_mouse_smoothly(self, page: Page, x: float, y: float) -> None:
+        start_x, start_y = self._mouse_position
+        distance = ((x - start_x) ** 2 + (y - start_y) ** 2) ** 0.5
+        if distance < 0.5:
+            self._mouse_position = (x, y)
+            return
+
+        duration = min(
+            MOUSE_MOVE_MAX_DURATION_SECONDS,
+            max(0.0, distance / MOUSE_MOVE_SPEED_PIXELS_PER_SECOND),
+        )
+        steps_by_distance = int(distance / MOUSE_MOVE_STEP_DISTANCE) + 1
+        steps_by_time = int(duration / MOUSE_MOVE_STEP_INTERVAL_SECONDS) + 1
+        steps = max(2, min(MOUSE_MOVE_MAX_STEPS, steps_by_distance, steps_by_time))
+        delay = duration / steps if duration > 0 else 0
+
+        for index in range(1, steps + 1):
+            progress = index / steps
+            # Smoothstep avoids a harsh start/stop without making the path slow.
+            eased = progress * progress * (3 - 2 * progress)
+            next_x = start_x + (x - start_x) * eased
+            next_y = start_y + (y - start_y) * eased
+            await page.mouse.move(next_x, next_y)
+            if delay > 0 and index < steps:
+                await asyncio.sleep(delay)
+        self._mouse_position = (x, y)
+
+    async def _move_mouse_directly(self, page: Page, x: float, y: float) -> None:
+        await page.mouse.move(x, y)
+        self._mouse_position = (x, y)
+
     async def _mouse_move(self, payload: dict[str, Any]) -> None:
         page = self._require_page()
         async with self._action_lock:
             x, y = await self._input_point(page, payload)
-            await page.mouse.move(x, y)
+            await self._move_mouse_smoothly(page, x, y)
             if not payload.get("focus_view_keep"):
                 self._clear_mobile_focus_zoom()
 
@@ -1128,7 +1709,7 @@ class BrowserSession:
             button = "left"
         async with self._action_lock:
             x, y = await self._input_point(page, payload)
-            await page.mouse.move(x, y)
+            await self._move_mouse_directly(page, x, y)
             if down:
                 await page.mouse.down(button=button)
             else:
@@ -1142,7 +1723,7 @@ class BrowserSession:
         async with self._action_lock:
             if "x" in payload and "y" in payload:
                 x, y = await self._input_point(page, payload)
-                await page.mouse.move(x, y)
+                await self._move_mouse_smoothly(page, x, y)
             await page.mouse.wheel(delta_x, delta_y)
             self._clear_mobile_focus_zoom()
 
@@ -1153,7 +1734,9 @@ class BrowserSession:
             if self._is_mobile:
                 await page.touchscreen.tap(x, y)
             else:
-                await page.mouse.click(x, y)
+                await self._move_mouse_directly(page, x, y)
+                await page.mouse.down()
+                await page.mouse.up()
 
     async def _pinch(self, payload: dict[str, Any]) -> None:
         page = self._require_page()
@@ -1174,7 +1757,7 @@ class BrowserSession:
                     await client.detach()
             except Exception:
                 x, y = await self._input_point(page, payload)
-                await page.mouse.move(x, y)
+                await self._move_mouse_smoothly(page, x, y)
                 await page.keyboard.down("Control")
                 try:
                     await page.mouse.wheel(0, -360 * (scale - 1.0))
@@ -1752,22 +2335,106 @@ class BrowserSession:
         queue = self._outgoing
         if queue is None:
             return
+        message_type = message.get("type")
         try:
             queue.put_nowait(message)
+            return
         except asyncio.QueueFull:
+            pass
+
+        if message_type == "audio" and message.get("kind") == "chunk":
+            self._drop_queued_messages(
+                queue,
+                lambda queued: queued.get("type") == "audio" and queued.get("kind") == "chunk",
+                limit=1,
+            )
+            if not queue.full():
+                queue.put_nowait(message)
+            return
+
+        self._drop_queued_messages(queue, lambda queued: queued.get("type") == "frame")
+        if queue.full():
+            self._drop_queued_messages(
+                queue,
+                lambda queued: queued.get("type") == "audio" and queued.get("kind") == "chunk",
+                limit=1,
+            )
+        if queue.full():
             try:
                 queue.get_nowait()
             except asyncio.QueueEmpty:
-                pass
+                return
+        queue.put_nowait(message)
+
+    async def _queue_audio(self, message: dict[str, Any]) -> None:
+        queue = self._audio_outgoing
+        if queue is None:
+            return
+        try:
             queue.put_nowait(message)
+            return
+        except asyncio.QueueFull:
+            pass
+
+        if message.get("kind") == "chunk":
+            self._drop_queued_messages(
+                queue,
+                lambda queued: queued.get("type") == "audio" and queued.get("kind") == "chunk",
+                limit=4,
+            )
+            if queue.full():
+                return
+            queue.put_nowait(message)
+            return
+
+        self._drop_queued_messages(
+            queue,
+            lambda queued: queued.get("type") == "audio" and queued.get("kind") == "chunk",
+            limit=1,
+        )
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+        queue.put_nowait(message)
 
     async def _queue_frame(self, message: dict[str, Any]) -> None:
         queue = self._outgoing
         if queue is None:
             return
+        self._drop_queued_messages(queue, lambda queued: queued.get("type") == "frame")
+        if queue.full():
+            self._drop_queued_messages(
+                queue,
+                lambda queued: queued.get("type") == "audio" and queued.get("kind") == "chunk",
+                limit=1,
+            )
         if queue.full():
             return
         await queue.put(message)
+
+    @staticmethod
+    def _drop_queued_messages(
+        queue: asyncio.Queue[dict[str, Any]],
+        predicate: Any,
+        *,
+        limit: int | None = None,
+    ) -> int:
+        kept: list[dict[str, Any]] = []
+        dropped = 0
+        while True:
+            try:
+                message = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if (limit is None or dropped < limit) and predicate(message):
+                dropped += 1
+                continue
+            kept.append(message)
+        for message in kept:
+            queue.put_nowait(message)
+        return dropped
 
     def _require_page(self) -> Page:
         if self.page is None or self.page.is_closed():
@@ -1899,6 +2566,12 @@ class BrowserManager:
 
             browser = await self.get_browser()
             context = await browser.new_context(**context_options)
+            await context.expose_binding(
+                "__websiteAgentAudioBridge",
+                lambda source, message, client_uuid=client_uuid: asyncio.create_task(
+                    self._handle_audio_bridge(client_uuid, message)
+                ),
+            )
             await context.route("**/*", self._guard_shared_context_route)
             await context.route_web_socket("**/*", self._guard_shared_context_websocket)
             self._client_contexts[client_uuid] = ClientContextEntry(
@@ -1955,6 +2628,12 @@ class BrowserManager:
             websocket.connect_to_server()
         except URLPolicyError as exc:
             await websocket.close(code=1008, reason=str(exc)[:120])
+
+    async def _handle_audio_bridge(self, client_uuid: str, message: Any) -> None:
+        session = self.get_session_for_client(client_uuid)
+        if session is None:
+            return
+        await session.handle_audio_bridge_message(message)
 
     def get_session(self, session_id: str) -> BrowserSession | None:
         return self._sessions.get(session_id)
@@ -2050,7 +2729,7 @@ async def _ignore_shutdown_disconnect(awaitable: Any) -> None:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        if not _is_shutdown_disconnect(exc):
+        if not _is_shutdown_disconnect(exc) and not _is_websocket_disconnect(exc):
             raise
 
 
@@ -2061,4 +2740,18 @@ def _is_shutdown_disconnect(exc: Exception) -> bool:
         or "target page, context or browser has been closed" in message
         or "browser has been closed" in message
         or "playwright connection closed" in message
+    )
+
+
+def _is_websocket_disconnect(exc: Exception) -> bool:
+    if isinstance(exc, WebSocketDisconnect):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc).lower()
+    return (
+        "websocket is not connected" in message
+        or "need to call \"accept\" first" in message
+        or "cannot call \"send\" once a close message has been sent" in message
+        or ("unexpected asgi message" in message and "websocket" in message)
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+import re
 from typing import Annotated
 from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
@@ -17,6 +18,7 @@ from .url_policy import HostAccessPolicy, URLPolicyError
 
 
 STATIC_DIR = PROJECT_ROOT / "static"
+PLAYWRIGHT_FILE_PAYLOAD_LIMIT_BYTES = 50 * 1024 * 1024
 manager = BrowserManager(settings)
 pin_auth = PinAuth(settings)
 
@@ -112,7 +114,8 @@ def _app_response(request: Request) -> FileResponse:
         "default-src 'self'; "
         "script-src 'self'; "
         "style-src 'self'; "
-        "img-src 'self' data:; "
+        "img-src 'self' data: blob:; "
+        "media-src 'self' data: blob:; "
         f"connect-src 'self' ws://{host} wss://{host}; "
         "object-src 'none'; "
         "base-uri 'self'; "
@@ -151,6 +154,16 @@ def _set_client_session_cookie(response: Response, client_uuid: str) -> None:
         secure=False,
         path="/",
     )
+
+
+def _upload_display_filename(filename: str | None) -> str:
+    name = Path(filename or "upload.bin").name
+    return name or "upload.bin"
+
+
+def _safe_upload_filename(filename: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", filename).strip(" .")
+    return cleaned or "upload.bin"
 
 
 def _require_owned_session(request: Request, session_id: str):
@@ -440,6 +453,22 @@ async def session_socket(websocket: WebSocket, session_id: str) -> None:
     await session.connect(websocket)
 
 
+@app.websocket("/ws/{session_id}/audio")
+async def session_audio_socket(websocket: WebSocket, session_id: str) -> None:
+    if not pin_auth.is_websocket_allowed(websocket):
+        await websocket.close(code=4401)
+        return
+    session = manager.get_session(session_id)
+    if session is None:
+        await websocket.close(code=4404)
+        return
+    client_uuid = websocket.cookies.get(settings.client_session_cookie_name, "")
+    if client_uuid != session.client_uuid:
+        await websocket.close(code=4403)
+        return
+    await session.connect_audio(websocket)
+
+
 @app.get("/api/sessions/{session_id}/downloads/{token}")
 async def download_file(request: Request, session_id: str, token: str) -> FileResponse:
     pin_auth.require_request(request)
@@ -462,14 +491,32 @@ async def choose_files(
     upload_dir = manager.client_uploads_dir(session.client_uuid) / session_id / token
     upload_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
+    payloads: list[dict[str, object]] = []
+    total_payload_size = 0
     for upload in files:
-        filename = Path(upload.filename or "upload.bin").name
-        path = upload_dir / filename
+        display_name = _upload_display_filename(upload.filename)
+        safe_name = _safe_upload_filename(display_name)
+        path = upload_dir / f"{len(paths):04d}-{safe_name}"
         content = await upload.read()
+        content_type = upload.content_type or "application/octet-stream"
         path.write_bytes(content)
         paths.append(path)
+        total_payload_size += len(content)
+        payloads.append(
+            {
+                "name": display_name,
+                "mimeType": content_type,
+                "buffer": content,
+            }
+        )
+    if not files:
+        selection: list[dict[str, object]] | list[Path] = []
+    elif total_payload_size <= PLAYWRIGHT_FILE_PAYLOAD_LIMIT_BYTES:
+        selection = payloads
+    else:
+        selection = paths
     try:
-        await session.upload_file_chooser(token, paths)
+        await session.upload_file_chooser(token, selection)
     except KeyError as exc:
         raise HTTPException(status_code=410, detail=str(exc)) from exc
     return {"status": "selected"}

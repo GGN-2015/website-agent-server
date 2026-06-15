@@ -9,7 +9,7 @@ Website Agent Server 是一个 Python 服务端浏览器代理。客户端不会
 - FastAPI 提供本地控制界面、HTTP API 和 WebSocket 端点。
 - Playwright 在服务器上启动 Chromium。
 - 目标网站运行在服务器端的浏览器上下文中。
-- 客户端只接收该浏览器视口的 JPEG 截图帧。
+- 客户端默认接收该浏览器视口的 JPEG 截图帧；当使用 `--screenshot-quality 100` 时接收 PNG 无损帧。
 - 用户操作由服务器转发并在 Chromium 中重放。
 - 输入法文本、粘贴、复制、剪切、下载、文件选择和 Cookie 管理通过本服务器接口中转。
 
@@ -65,7 +65,7 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | `--session-ttl-seconds` | `600` | 客户端断线后的会话和客户端浏览器上下文保留时间。客户端可在该时间内重连到缓存的浏览器会话。 |
 | `--navigation-timeout-ms` | `30000` | 导航超时时间。 |
 | `--frame-interval-seconds` | `0.18` | 截图帧推送间隔。 |
-| `--screenshot-quality` | `95` | JPEG 画面质量，范围 1 到 100。 |
+| `--screenshot-quality` | `95` | 画面质量，范围 1 到 100。低于 100 使用 JPEG；100 使用 PNG。 |
 | `--min-viewport-width` | `320` | 最小远程视口宽度。 |
 | `--min-viewport-height` | `240` | 最小远程视口高度。 |
 | `--max-viewport-width` | `1920` | 最大远程视口宽度。 |

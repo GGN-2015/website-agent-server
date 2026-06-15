@@ -18,6 +18,8 @@ class Settings:
     navigation_timeout_ms: int = 30000
     frame_interval_seconds: float = 0.18
     screenshot_quality: int = 95
+    media_frame_interval_seconds: float = 0.35
+    media_screenshot_quality: int = 80
     min_viewport_width: int = 320
     min_viewport_height: int = 240
     max_viewport_width: int = 1920

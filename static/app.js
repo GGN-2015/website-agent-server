@@ -1,6 +1,7 @@
 const state = {
   sessionId: null,
   socket: null,
+  audioSocket: null,
   frameWidth: 1280,
   frameHeight: 720,
   connected: false,
@@ -13,6 +14,9 @@ const state = {
   locked: false,
   lockUrl: "",
   waitingForFrame: false,
+  loadingAwaitingStatusUrl: false,
+  loadingTargetUrl: "",
+  loadingTimeout: null,
   mobileClient: false,
   lastPointerType: "",
   remoteTextFocused: false,
@@ -34,6 +38,16 @@ const state = {
   intentionalSocketClose: false,
   mobileBackGuardPrimed: false,
   remoteCaret: null,
+  audioStreams: new Map(),
+  audioUnlocked: false,
+  audioUserActivated: false,
+  audioContext: null,
+  lastAudioRms: 0,
+  lastAudioSampleAt: 0,
+  audioPlaybackErrors: [],
+  pendingFrameHeader: null,
+  pendingFrameTimer: null,
+  frameObjectUrl: "",
 };
 window.websiteAgentState = state;
 
@@ -81,6 +95,9 @@ const TOUCH_HOVER_DELAY_MS = 450;
 const PINCH_START_MIN_DISTANCE = 24;
 const PINCH_STEP_MIN_RATIO = 0.035;
 const PINCH_SCALE_RESPONSE = 0.5;
+const DESKTOP_IME_OFFSET_X = 10;
+const DESKTOP_IME_OFFSET_Y = 8;
+const NAVIGATION_LOADING_MAX_MS = 2500;
 
 function detectMobileClient() {
   const coarsePointer =
@@ -106,8 +123,33 @@ function showLoading(message = "Server loading ...") {
 
 function hideLoading() {
   state.waitingForFrame = false;
+  state.loadingAwaitingStatusUrl = false;
+  state.loadingTargetUrl = "";
+  if (state.loadingTimeout !== null) {
+    window.clearTimeout(state.loadingTimeout);
+    state.loadingTimeout = null;
+  }
   loadingOverlay.hidden = true;
   loadingOverlay.setAttribute("aria-busy", "false");
+}
+
+function armNavigationLoadingTimeout() {
+  if (state.loadingTimeout !== null) {
+    window.clearTimeout(state.loadingTimeout);
+  }
+  state.loadingTimeout = window.setTimeout(() => {
+    state.loadingAwaitingStatusUrl = false;
+    state.loadingTargetUrl = "";
+    state.loadingTimeout = null;
+    hideLoading();
+  }, NAVIGATION_LOADING_MAX_MS);
+}
+
+function sameUrlWithoutHash(left, right) {
+  if (!left || !right) {
+    return false;
+  }
+  return String(left).split("#", 1)[0] === String(right).split("#", 1)[0];
 }
 
 function setControlsEnabled(enabled) {
@@ -364,9 +406,11 @@ function connectSession(sessionId) {
     state.socket.__websiteAgentIntentionalClose = true;
     state.socket.close();
   }
+  closeAudioSocket();
   state.intentionalSocketClose = false;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${protocol}//${window.location.host}/ws/${sessionId}`);
+  socket.binaryType = "arraybuffer";
   state.socket = socket;
 
   socket.addEventListener("open", () => {
@@ -381,9 +425,14 @@ function connectSession(sessionId) {
     if (!state.mobileClient) {
       focusInputProxy();
     }
+    connectAudioSession(sessionId);
   });
 
   socket.addEventListener("message", (event) => {
+    if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+      handleFrameBinary(event.data);
+      return;
+    }
     const message = JSON.parse(event.data);
     handleServerMessage(message);
   });
@@ -396,6 +445,8 @@ function connectSession(sessionId) {
     state.connected = false;
     setControlsEnabled(false);
     hideLoading();
+    closeAudioSocket();
+    cleanupAudioStreams();
     if (!state.quitting && state.sessionId) {
       setStatus("Disconnected");
       if (!intentionalClose) {
@@ -406,6 +457,32 @@ function connectSession(sessionId) {
       state.intentionalSocketClose = false;
     }
   });
+}
+
+function connectAudioSession(sessionId) {
+  closeAudioSocket();
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${protocol}//${window.location.host}/ws/${sessionId}/audio`);
+  state.audioSocket = socket;
+  socket.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === "audio") {
+      handleAudioMessage(message);
+    }
+  });
+  socket.addEventListener("close", () => {
+    if (state.audioSocket === socket) {
+      state.audioSocket = null;
+    }
+  });
+}
+
+function closeAudioSocket() {
+  if (!state.audioSocket) {
+    return;
+  }
+  state.audioSocket.close();
+  state.audioSocket = null;
 }
 
 function scheduleReconnect() {
@@ -453,6 +530,222 @@ function resetViewport() {
   hideRemoteCaret();
 }
 
+function clearFrameObjectUrl() {
+  if (state.frameObjectUrl) {
+    window.URL.revokeObjectURL(state.frameObjectUrl);
+    state.frameObjectUrl = "";
+  }
+}
+
+function clearPendingFrame() {
+  state.pendingFrameHeader = null;
+  if (state.pendingFrameTimer !== null) {
+    window.clearTimeout(state.pendingFrameTimer);
+    state.pendingFrameTimer = null;
+  }
+}
+
+function base64ToArrayBuffer(value) {
+  const binary = window.atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes.buffer;
+}
+
+function cleanupAudioStream(streamId) {
+  const stream = state.audioStreams.get(streamId);
+  if (!stream) {
+    return;
+  }
+  state.audioStreams.delete(streamId);
+  window.clearTimeout(stream.stopTimer);
+  try {
+    if (stream.sourceBuffer && stream.mediaSource.readyState === "open") {
+      stream.mediaSource.endOfStream();
+    }
+  } catch {
+    // The media source may already be closing.
+  }
+  try {
+    if (stream.sourceNode) {
+      stream.sourceNode.disconnect();
+    }
+    if (stream.analyser) {
+      stream.analyser.disconnect();
+    }
+  } catch {
+    // Nodes may already be disconnected.
+  }
+  if (stream.sampleTimer !== null) {
+    window.clearInterval(stream.sampleTimer);
+  }
+  stream.audio.pause();
+  stream.audio.remove();
+  window.URL.revokeObjectURL(stream.url);
+}
+
+function cleanupAudioStreams() {
+  for (const streamId of [...state.audioStreams.keys()]) {
+    cleanupAudioStream(streamId);
+  }
+}
+
+function makeAudioStream(streamId, mime) {
+  cleanupAudioStream(streamId);
+  const mediaSource = new MediaSource();
+  const audio = document.createElement("audio");
+  audio.autoplay = true;
+  audio.playsInline = true;
+  audio.hidden = true;
+  const url = window.URL.createObjectURL(mediaSource);
+  audio.src = url;
+  document.body.appendChild(audio);
+  const stream = {
+    streamId,
+    audio,
+    url,
+    mediaSource,
+    sourceBuffer: null,
+    queue: [],
+    mime,
+    stopTimer: null,
+    sourceNode: null,
+    analyser: null,
+    sampleTimer: null,
+  };
+  state.audioStreams.set(streamId, stream);
+  attachAudioAnalyser(stream);
+  mediaSource.addEventListener("sourceopen", () => {
+    try {
+      stream.sourceBuffer = mediaSource.addSourceBuffer(mime);
+      stream.sourceBuffer.mode = "sequence";
+      stream.sourceBuffer.addEventListener("updateend", () => pumpAudioStream(stream));
+      pumpAudioStream(stream);
+      unlockAudioPlayback();
+    } catch {
+      cleanupAudioStream(streamId);
+    }
+  });
+  return stream;
+}
+
+function ensureAudioContext() {
+  if (!state.audioContext) {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      return null;
+    }
+    state.audioContext = new AudioContextClass();
+  }
+  return state.audioContext;
+}
+
+function attachAudioAnalyser(stream) {
+  const audioContext = ensureAudioContext();
+  if (!audioContext) {
+    return;
+  }
+  try {
+    stream.sourceNode = audioContext.createMediaElementSource(stream.audio);
+    stream.analyser = audioContext.createAnalyser();
+    stream.analyser.fftSize = 256;
+    stream.sourceNode.connect(stream.analyser);
+    stream.analyser.connect(audioContext.destination);
+    const samples = new Uint8Array(stream.analyser.fftSize);
+    stream.sampleTimer = window.setInterval(() => {
+      stream.analyser.getByteTimeDomainData(samples);
+      let sum = 0;
+      for (const sample of samples) {
+        const centered = (sample - 128) / 128;
+        sum += centered * centered;
+      }
+      const rms = Math.sqrt(sum / samples.length);
+      state.lastAudioRms = Math.max(state.lastAudioRms * 0.85, rms);
+      state.lastAudioSampleAt = performance.now();
+    }, 100);
+  } catch (error) {
+    state.audioPlaybackErrors.push(String(error && error.message ? error.message : error));
+  }
+}
+
+function pumpAudioStream(stream) {
+  if (
+    !stream.sourceBuffer ||
+    stream.sourceBuffer.updating ||
+    stream.mediaSource.readyState !== "open" ||
+    stream.queue.length === 0
+  ) {
+    return;
+  }
+  try {
+    stream.sourceBuffer.appendBuffer(stream.queue.shift());
+    if (state.audioUserActivated) {
+      playAudioStreams();
+    }
+  } catch {
+    cleanupAudioStream(stream.streamId);
+  }
+}
+
+function playAudioStreams() {
+  if (state.audioContext && state.audioContext.state === "suspended") {
+    state.audioContext.resume().catch(() => {});
+  }
+  for (const stream of state.audioStreams.values()) {
+    const playPromise = stream.audio.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch((error) => {
+        state.audioUnlocked = false;
+        state.audioPlaybackErrors.push(String(error && error.message ? error.message : error));
+      });
+    }
+  }
+}
+
+function unlockAudioPlayback() {
+  state.audioUserActivated = true;
+  state.audioUnlocked = true;
+  ensureAudioContext();
+  playAudioStreams();
+}
+
+function handleAudioMessage(message) {
+  const streamId = message.streamId || "media";
+  if (message.kind === "stop") {
+    const stream = state.audioStreams.get(streamId);
+    if (stream) {
+      window.clearTimeout(stream.stopTimer);
+      stream.stopTimer = window.setTimeout(() => cleanupAudioStream(streamId), 1200);
+    }
+    return;
+  }
+  if (message.kind === "start") {
+    if (message.mime && window.MediaSource && MediaSource.isTypeSupported(message.mime)) {
+      makeAudioStream(streamId, message.mime);
+    }
+    return;
+  }
+  if (message.kind !== "chunk" || !message.data || !message.mime) {
+    return;
+  }
+  let stream = state.audioStreams.get(streamId);
+  if (!stream) {
+    if (!window.MediaSource || !MediaSource.isTypeSupported(message.mime)) {
+      return;
+    }
+    stream = makeAudioStream(streamId, message.mime);
+  }
+  window.clearTimeout(stream.stopTimer);
+  stream.stopTimer = null;
+  stream.queue.push(base64ToArrayBuffer(message.data));
+  pumpAudioStream(stream);
+  if (state.audioUserActivated) {
+    playAudioStreams();
+  }
+}
+
 async function quitSession() {
   if (state.locked) {
     return;
@@ -475,6 +768,7 @@ async function quitSession() {
     state.socket.close();
     state.socket = null;
   }
+  closeAudioSocket();
   state.connected = false;
   state.sessionId = null;
   state.lastSentViewport = null;
@@ -486,6 +780,7 @@ async function quitSession() {
   }
   resetViewport();
   hideLoading();
+  cleanupAudioStreams();
   addressInput.value = "";
   launchError.textContent = "";
   launcher.hidden = state.locked;
@@ -505,7 +800,15 @@ function handleServerMessage(message) {
     }
     if (message.state === "loading") {
       state.mobileInputViewArmed = true;
+      state.loadingAwaitingStatusUrl = false;
+      state.loadingTargetUrl = message.url || state.loadingTargetUrl;
       showLoading();
+      armNavigationLoadingTimeout();
+    } else if (message.url) {
+      state.loadingAwaitingStatusUrl = false;
+      if (state.loadingTargetUrl && !sameUrlWithoutHash(message.url, state.loadingTargetUrl)) {
+        state.loadingTargetUrl = message.url;
+      }
     }
     setStatus(message.state || "Ready");
   } else if (message.type === "error") {
@@ -527,6 +830,8 @@ function handleServerMessage(message) {
     handleRemoteClipboard(message.text || "");
   } else if (message.type === "editable") {
     handleEditableProbe(message);
+  } else if (message.type === "audio") {
+    handleAudioMessage(message);
   }
 }
 
@@ -548,10 +853,49 @@ function hideRemoteCaret() {
   remoteCaret.hidden = true;
 }
 
+function remoteCaretClientRect() {
+  const caret = state.remoteCaret;
+  if (!caret || typeof caret.x !== "number" || typeof caret.y !== "number") {
+    return null;
+  }
+  const display = state.frameDisplay;
+  const wrapRect = viewportWrap.getBoundingClientRect();
+  const scaleX = display.width / Math.max(1, state.frameWidth);
+  const scaleY = display.height / Math.max(1, state.frameHeight);
+  const left = wrapRect.left + display.offsetX + caret.x * scaleX;
+  const top = wrapRect.top + display.offsetY + caret.y * scaleY;
+  const width = Math.max(1, caret.width * scaleX);
+  const height = Math.max(8, caret.height * scaleY);
+  return { left, top, width, height };
+}
+
+function updateDesktopImeAnchor() {
+  if (state.mobileClient || !state.remoteTextFocused) {
+    return;
+  }
+  const caretRect = remoteCaretClientRect();
+  if (!caretRect) {
+    return;
+  }
+  const proxyWidth = Math.max(2, inputProxy.offsetWidth || 2);
+  const proxyHeight = Math.max(2, inputProxy.offsetHeight || 2);
+  const x = Math.min(
+    Math.max(0, caretRect.left + caretRect.width + DESKTOP_IME_OFFSET_X),
+    Math.max(0, window.innerWidth - proxyWidth)
+  );
+  const y = Math.min(
+    Math.max(0, caretRect.top + caretRect.height + DESKTOP_IME_OFFSET_Y),
+    Math.max(0, window.innerHeight - proxyHeight)
+  );
+  inputProxy.style.left = `${Math.floor(x)}px`;
+  inputProxy.style.top = `${Math.floor(y)}px`;
+}
+
 function updateRemoteCaret() {
   const caret = state.remoteCaret;
   if (!caret || typeof caret.x !== "number" || typeof caret.y !== "number") {
     remoteCaret.hidden = true;
+    updateDesktopImeAnchor();
     return;
   }
   const display = state.frameDisplay;
@@ -566,11 +910,47 @@ function updateRemoteCaret() {
   remoteCaret.style.width = `${width}px`;
   remoteCaret.style.height = `${height}px`;
   remoteCaret.hidden = false;
+  updateDesktopImeAnchor();
 }
 
 function drawFrame(message) {
   state.frameWidth = message.width;
   state.frameHeight = message.height;
+  if (!message.image) {
+    clearPendingFrame();
+    state.pendingFrameHeader = message;
+    state.pendingFrameTimer = window.setTimeout(() => {
+      clearPendingFrame();
+      if (!state.loadingAwaitingStatusUrl && !state.loadingTargetUrl) {
+        hideLoading();
+      }
+    }, 2500);
+    return;
+  }
+  drawFrameImage(message, `data:${message.mime};base64,${message.image}`);
+}
+
+function handleFrameBinary(data) {
+  const message = state.pendingFrameHeader;
+  clearPendingFrame();
+  if (!message) {
+    return;
+  }
+  const blob = data instanceof Blob ? data : new Blob([data], { type: message.mime || "image/jpeg" });
+  clearFrameObjectUrl();
+  state.frameObjectUrl = window.URL.createObjectURL(blob);
+  drawFrameImage(message, state.frameObjectUrl);
+}
+
+function drawFrameImage(message, imageSource) {
+  state.frameWidth = message.width;
+  state.frameHeight = message.height;
+  if (
+    state.loadingTargetUrl &&
+    (!message.url || sameUrlWithoutHash(message.url, state.loadingTargetUrl))
+  ) {
+    state.loadingTargetUrl = "";
+  }
   state.remoteCaret =
     (!state.mobileClient || state.remoteTextFocused) && message.caret ? message.caret : null;
   if (addressInput !== document.activeElement && message.url) {
@@ -586,12 +966,20 @@ function drawFrame(message) {
     context.fillRect(0, 0, canvas.width, canvas.height);
     context.drawImage(image, 0, 0, canvas.width, canvas.height);
     updateFrameDisplay();
-    hideLoading();
+    if (!state.loadingAwaitingStatusUrl && !state.loadingTargetUrl) {
+      hideLoading();
+    }
   };
-  image.src = `data:${message.mime};base64,${message.image}`;
+  image.onerror = () => {
+    if (!state.loadingAwaitingStatusUrl && !state.loadingTargetUrl) {
+      hideLoading();
+    }
+  };
+  image.src = imageSource;
 }
 
 function send(message) {
+  unlockAudioPlayback();
   if (
     state.locked &&
     (message.type === "navigate" || message.type === "back" || message.type === "forward")
@@ -604,6 +992,9 @@ function send(message) {
   if (["navigate", "reload", "back", "forward"].includes(message.type)) {
     state.mobileInputViewArmed = true;
     showLoading();
+    state.loadingAwaitingStatusUrl = true;
+    state.loadingTargetUrl = "";
+    armNavigationLoadingTimeout();
   }
   state.socket.send(JSON.stringify(message));
 }
@@ -614,6 +1005,7 @@ function focusInputProxy(clientX, clientY) {
     inputProxy.style.left = `${Math.max(0, Math.floor(clientX))}px`;
     inputProxy.style.top = `${Math.max(0, Math.floor(clientY))}px`;
   }
+  updateDesktopImeAnchor();
   inputProxy.focus({ preventScroll: true });
 }
 
@@ -850,6 +1242,7 @@ function clearTouchState() {
 }
 
 function handleCanvasTouchStart(event) {
+  unlockAudioPlayback();
   if (!state.mobileClient) {
     return;
   }
@@ -1586,6 +1979,7 @@ function updateCookieCount() {
 canvas.addEventListener("contextmenu", (event) => event.preventDefault());
 
 canvas.addEventListener("pointerdown", (event) => {
+  unlockAudioPlayback();
   state.lastPointerType = event.pointerType || "";
   if (state.mobileClient && event.pointerType === "touch") {
     return;
@@ -1635,6 +2029,7 @@ canvas.addEventListener("touchcancel", handleCanvasTouchCancel, { passive: false
 canvas.addEventListener(
   "wheel",
   (event) => {
+    unlockAudioPlayback();
     event.preventDefault();
     send({ type: "wheel", deltaX: event.deltaX, deltaY: event.deltaY });
   },
@@ -1794,6 +2189,7 @@ inputProxy.addEventListener("cut", (event) => {
 });
 
 inputProxy.addEventListener("keydown", (event) => {
+  unlockAudioPlayback();
   if (!shouldForwardKeyboard()) {
     return;
   }
@@ -1907,17 +2303,35 @@ function openFileChooser(message) {
   input.style.display = "none";
   document.body.appendChild(input);
   input.addEventListener("change", async () => {
+    if (!input.files || input.files.length === 0) {
+      input.remove();
+      if (!state.mobileClient || state.remoteTextFocused) {
+        focusInputProxy();
+      }
+      return;
+    }
     const form = new FormData();
     for (const file of input.files) {
       form.append("files", file);
     }
-    await fetch(`/api/sessions/${state.sessionId}/file-chooser/${message.token}`, {
-      method: "POST",
-      body: form,
-    });
-    input.remove();
-    if (!state.mobileClient || state.remoteTextFocused) {
-      focusInputProxy();
+    try {
+      const response = await fetch(`/api/sessions/${state.sessionId}/file-chooser/${message.token}`, {
+        method: "POST",
+        body: form,
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(body.detail || "File upload failed.");
+      }
+      setStatus("Files selected");
+    } catch (error) {
+      setStatus("File upload failed");
+      launchError.textContent = error.message || "File upload failed.";
+    } finally {
+      input.remove();
+      if (!state.mobileClient || state.remoteTextFocused) {
+        focusInputProxy();
+      }
     }
   });
   input.click();

@@ -9,9 +9,9 @@ Website Agent Server is a Python server-side browser proxy. The client never loa
 - FastAPI serves the local control UI, HTTP API, and WebSocket endpoint.
 - Playwright launches Chromium on the server.
 - The target website runs inside the server-side browser context.
-- The client receives JPEG screenshots of that browser viewport.
+- The client receives binary WebSocket image frames: JPEG screenshots by default, or PNG frames when `--screenshot-quality 100` is used.
 - User actions are replayed into Chromium by the server.
-- IME text, paste, copy, cut, downloads, file chooser actions, and cookie management are brokered through local server endpoints.
+- IME text, paste, copy, cut, downloads, file chooser actions, cookie management, and ordinary media element audio are brokered through local server endpoints.
 
 Because the remote page is never embedded as HTML in the client, page scripts, link clicks, images, XHR/fetch calls, WebSocket connections, and form submissions are performed by the server-side browser.
 
@@ -65,7 +65,9 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | `--session-ttl-seconds` | `600` | Disconnected client session and client browser context lifetime. A client can reconnect to its cached browser session during this window. |
 | `--navigation-timeout-ms` | `30000` | Navigation timeout. |
 | `--frame-interval-seconds` | `0.18` | Screenshot streaming interval. |
-| `--screenshot-quality` | `95` | JPEG frame quality, from 1 to 100. |
+| `--screenshot-quality` | `95` | Frame quality from 1 to 100. Values below 100 use JPEG; 100 uses PNG. |
+| `--media-frame-interval-seconds` | `0.35` | Screenshot streaming interval while remote media is playing. |
+| `--media-screenshot-quality` | `80` | JPEG quality while remote media is playing. Ignored when `--screenshot-quality 100` enables PNG. |
 | `--min-viewport-width` | `320` | Minimum remote viewport width. |
 | `--min-viewport-height` | `240` | Minimum remote viewport height. |
 | `--max-viewport-width` | `1920` | Maximum remote viewport width. |
@@ -95,6 +97,8 @@ Mobile clients use a mobile Playwright browser profile with a narrow viewport, t
 The local `session-uuid` cookie only identifies the Website Agent client, not the remote site. If the local page refreshes or the WebSocket drops, the server uses that cookie to reconnect the same client to its existing browser session. Disconnected browser sessions and idle client contexts are removed after `--session-ttl-seconds`, which is 10 minutes by default. When a UUID is removed, its BrowserContext, browsing history, cookies, localStorage, IndexedDB, download files, upload files, and in-memory session records are removed together.
 
 Uvicorn's WebSocket ping keepalive is disabled because mobile browsers may suspend sockets while loading, switching apps, or sleeping. The client reconnect path and session TTL handle those drops without printing keepalive tracebacks.
+
+Audio from ordinary server-side `<audio>` and `<video>` elements is captured in the page with `captureStream()` or a WebAudio fallback and forwarded over a dedicated WebSocket as WebM/Opus chunks, separate from screenshot frames. The server-side page is not relied on for audible playback. When remote media is playing, screenshot streaming automatically uses `--media-frame-interval-seconds` and `--media-screenshot-quality` to reduce CPU and network pressure. This does not cover DRM media, WebRTC calls, pure WebAudio graphs, browser UI sounds, or system-level mixed audio.
 
 ## Limitations
 
