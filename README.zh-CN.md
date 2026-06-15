@@ -33,6 +33,16 @@ venv\Scripts\python.exe -m website_agent_server
 
 打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)，输入目标网站 URL，然后在渲染视口中操作远程网站。服务默认监听所有网卡，所以局域网客户端也可以用服务器机器的局域网 IP 连接。
 
+如果目标 URL 没有填写 `http://` 或 `https://` 前缀，服务端会先探测 HTTPS；HTTPS 服务可用时使用 HTTPS，否则回退到 HTTP。`--lock-url` 和 `/lock_url/...` 路径也遵循同样规则。
+
+也可以只锁定某一个客户端，把目标 URL 放到服务器 URL 路径里：
+
+```text
+http://127.0.0.1:8000/lock_url/https/example.com/path
+```
+
+这个客户端会立即打开目标网站，并隐藏浏览器选项控件。其他访问 `/` 的客户端仍然保持普通 URL 输入模式。查询参数和片段会保留，例如 `/lock_url/https/example.com/path?x=1#section`。
+
 ## 命令行配置
 
 ```powershell
@@ -52,10 +62,10 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | `--headed` | 禁用 | 使用可见浏览器窗口运行 Chromium。 |
 | `--ignore-https-errors` | 禁用 | 忽略远程 TLS 证书错误。 |
 | `--allow-private-hosts` | 禁用 | 允许访问私有、本地或保留网段。 |
-| `--session-ttl-seconds` | `900` | 空闲会话保留时间。 |
+| `--session-ttl-seconds` | `600` | 客户端断线后的会话和客户端浏览器上下文保留时间。客户端可在该时间内重连到缓存的浏览器会话。 |
 | `--navigation-timeout-ms` | `30000` | 导航超时时间。 |
 | `--frame-interval-seconds` | `0.18` | 截图帧推送间隔。 |
-| `--screenshot-quality` | `72` | JPEG 画面质量，范围 1 到 100。 |
+| `--screenshot-quality` | `95` | JPEG 画面质量，范围 1 到 100。 |
 | `--min-viewport-width` | `320` | 最小远程视口宽度。 |
 | `--min-viewport-height` | `240` | 最小远程视口高度。 |
 | `--max-viewport-width` | `1920` | 最大远程视口宽度。 |
@@ -77,6 +87,14 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 ```powershell
 venv\Scripts\python.exe -m website_agent_server --allow-private-hosts --pin 123456
 ```
+
+每个客户端只会得到一个服务端 Playwright `BrowserContext`，它只由本地 `session-uuid` Cookie 决定。上下文不会再按 IP 地址、目标 host、端口、URL 路径或设备类型共享。同一个客户端在 UUID 过期前打开另一个目标 URL 时，旧页面会关闭，但会复用同一个上下文，包括存储分区、Service Worker、权限和其他浏览器上下文状态。
+
+手机端客户端会使用移动端 Playwright 浏览器配置，包括窄视口、触控能力、移动版 Chromium User-Agent 和移动端 Client Hints，方便上游响应式网站选择手机页面。
+
+本地 `session-uuid` Cookie 只用于识别 Website Agent 客户端，不是远程网站 Cookie。如果本地页面刷新或 WebSocket 掉线，服务端会用这个 Cookie 把同一个客户端重新连接到已有浏览器会话。断线浏览器会话和空闲客户端上下文会在 `--session-ttl-seconds` 秒后删除，默认是 10 分钟。某个 UUID 被删除时，它对应的 BrowserContext、浏览历史、Cookie、localStorage、IndexedDB、下载文件、上传文件和内存会话记录会一起删除。
+
+服务端关闭了 Uvicorn 的 WebSocket ping keepalive，因为手机浏览器在加载、切后台或休眠时可能挂起 socket。客户端重连逻辑和会话 TTL 会处理这类断线，同时避免 keepalive traceback 刷屏。
 
 ## 限制
 

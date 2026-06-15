@@ -34,6 +34,13 @@
 
       <section id="viewport-wrap" class="viewport-wrap" aria-label="Remote browser viewport">
         <canvas id="viewport" tabindex="0"></canvas>
+        <div id="remote-caret" class="remote-caret" hidden></div>
+        <div id="loading-overlay" class="loading-overlay" aria-live="polite" aria-busy="true" hidden>
+          <div class="loading-indicator">
+            <span class="loading-spinner" aria-hidden="true"></span>
+            <span id="loading-text" class="loading-text">Server loading ...</span>
+          </div>
+        </div>
         <textarea
           id="input-proxy"
           class="input-proxy"
@@ -41,6 +48,8 @@
           autocomplete="off"
           autocapitalize="off"
           autocorrect="off"
+          inputmode="text"
+          enterkeyhint="done"
           spellcheck="false"
         ></textarea>
       </section>
@@ -73,11 +82,31 @@
           <div>
             <h2 id="cookie-title">Cookies</h2>
             <p id="cookie-summary" class="modal-subtitle">Current page</p>
+            <p id="cookie-sync-status" class="cookie-sync-status" hidden></p>
           </div>
-          <button id="cookie-close-button" class="icon-button" type="button" title="Close" aria-label="Close">x</button>
+          <div class="modal-actions">
+            <button id="cookie-refresh-button" class="tool-button" type="button">Refresh</button>
+            <button id="cookie-close-button" class="icon-button" type="button" title="Close" aria-label="Close">x</button>
+          </div>
         </header>
         <div id="cookie-error" class="modal-error" role="alert"></div>
-        <div id="cookie-list" class="cookie-list"></div>
+        <div class="cookie-editor">
+          <div id="cookie-list" class="cookie-list"></div>
+          <section class="cookie-json-panel" aria-label="Cookie JSON editor">
+            <header class="cookie-json-header">
+              <span>JSON</span>
+              <button id="cookie-json-restore-button" class="tool-button" type="button">Restore</button>
+            </header>
+            <textarea
+              id="cookie-json-input"
+              class="cookie-json-input"
+              spellcheck="false"
+              autocomplete="off"
+              autocapitalize="off"
+              autocorrect="off"
+            ></textarea>
+          </section>
+        </div>
         <footer class="modal-footer">
           <button id="cookie-add-button" class="tool-button" type="button">Add</button>
           <span id="cookie-count" class="cookie-count"></span>

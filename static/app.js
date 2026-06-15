@@ -12,6 +12,28 @@ const state = {
   quitting: false,
   locked: false,
   lockUrl: "",
+  waitingForFrame: false,
+  mobileClient: false,
+  lastPointerType: "",
+  remoteTextFocused: false,
+  mobileInputViewArmed: false,
+  touchGesture: null,
+  activeTouches: new Map(),
+  pinchGesture: null,
+  mobileLayoutViewport: null,
+  lastSentViewport: null,
+  frameDisplay: { offsetX: 0, offsetY: 0, width: 1280, height: 720 },
+  cookieSyncTimer: null,
+  cookieSyncInFlight: false,
+  cookieSnapshot: "",
+  cookieDirty: false,
+  cookieServerChanged: false,
+  mobileBackGuardInstalled: false,
+  reconnectTimer: null,
+  reconnectAttempts: 0,
+  intentionalSocketClose: false,
+  mobileBackGuardPrimed: false,
+  remoteCaret: null,
 };
 window.websiteAgentState = state;
 
@@ -32,20 +54,60 @@ const goButton = document.getElementById("go-button");
 const statusText = document.getElementById("status-text");
 const viewportWrap = document.getElementById("viewport-wrap");
 const canvas = document.getElementById("viewport");
+const remoteCaret = document.getElementById("remote-caret");
 const inputProxy = document.getElementById("input-proxy");
+const loadingOverlay = document.getElementById("loading-overlay");
+const loadingText = document.getElementById("loading-text");
 const cookieDialog = document.getElementById("cookie-dialog");
 const cookieSummary = document.getElementById("cookie-summary");
 const cookieError = document.getElementById("cookie-error");
 const cookieList = document.getElementById("cookie-list");
 const cookieCount = document.getElementById("cookie-count");
+const cookieSyncStatus = document.getElementById("cookie-sync-status");
+const cookieRefreshButton = document.getElementById("cookie-refresh-button");
 const cookieCloseButton = document.getElementById("cookie-close-button");
 const cookieCancelButton = document.getElementById("cookie-cancel-button");
 const cookieAddButton = document.getElementById("cookie-add-button");
 const cookieSaveButton = document.getElementById("cookie-save-button");
+const cookieJsonInput = document.getElementById("cookie-json-input");
+const cookieJsonRestoreButton = document.getElementById("cookie-json-restore-button");
 const context = canvas.getContext("2d", { alpha: false });
+const COOKIE_SYNC_INTERVAL_MS = 2500;
+const MOBILE_VIEWPORT_MAX_WIDTH = 430;
+const TOUCH_TAP_MAX_MOVE = 8;
+const TOUCH_SCROLL_MIN_MOVE = 6;
+const TOUCH_WHEEL_SCALE = 1.15;
+const TOUCH_HOVER_DELAY_MS = 450;
+const PINCH_START_MIN_DISTANCE = 24;
+const PINCH_STEP_MIN_RATIO = 0.035;
+const PINCH_SCALE_RESPONSE = 0.5;
+
+function detectMobileClient() {
+  const coarsePointer =
+    window.matchMedia && window.matchMedia("(hover: none) and (pointer: coarse)").matches;
+  const userAgentMobile =
+    navigator.userAgentData && typeof navigator.userAgentData.mobile === "boolean"
+      ? navigator.userAgentData.mobile
+      : /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+  return Boolean(coarsePointer || userAgentMobile);
+}
 
 function setStatus(text) {
   statusText.textContent = text;
+}
+
+function showLoading(message = "Server loading ...") {
+  state.waitingForFrame = true;
+  ensureMobileBackGuard();
+  loadingText.textContent = message;
+  loadingOverlay.hidden = false;
+  loadingOverlay.setAttribute("aria-busy", "true");
+}
+
+function hideLoading() {
+  state.waitingForFrame = false;
+  loadingOverlay.hidden = true;
+  loadingOverlay.setAttribute("aria-busy", "false");
 }
 
 function setControlsEnabled(enabled) {
@@ -68,12 +130,161 @@ function setControlsEnabled(enabled) {
   goButton.disabled = !enabled;
 }
 
+function handleBackCommand() {
+  if (state.waitingForFrame) {
+    setStatus("Loading");
+    return;
+  }
+  if (state.locked) {
+    setStatus("Options locked");
+    return;
+  }
+  if (!state.sessionId || !state.connected) {
+    return;
+  }
+  send({ type: "back" });
+}
+
+function currentHistoryState() {
+  return history.state && typeof history.state === "object" ? history.state : {};
+}
+
+function canUseMobileBackGuard() {
+  return (
+    state.mobileClient &&
+    window.history &&
+    typeof history.pushState === "function" &&
+    typeof history.replaceState === "function"
+  );
+}
+
+function ensureMobileBackGuard() {
+  if (!canUseMobileBackGuard()) {
+    return false;
+  }
+  try {
+    const currentState = currentHistoryState();
+    if (!currentState.websiteAgentGuard) {
+      const rootState = currentState.websiteAgentRoot
+        ? currentState
+        : { ...currentState, websiteAgentRoot: true };
+      history.replaceState(rootState, "", window.location.href);
+      history.pushState({ websiteAgentGuard: true }, "", window.location.href);
+    }
+    if (!state.mobileBackGuardPrimed) {
+      history.pushState({ websiteAgentGuard: true }, "", window.location.href);
+      state.mobileBackGuardPrimed = true;
+    }
+    state.mobileBackGuardInstalled = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function installMobileBackGuard() {
+  ensureMobileBackGuard();
+}
+
+function restoreMobileBackGuard() {
+  if (!canUseMobileBackGuard()) {
+    return;
+  }
+  try {
+    history.pushState({ websiteAgentGuard: true }, "", window.location.href);
+    state.mobileBackGuardInstalled = true;
+    state.mobileBackGuardPrimed = true;
+  } catch {
+    // If the browser refuses history manipulation, the normal page lifecycle continues.
+  }
+}
+
+function handleMobileBrowserBack() {
+  restoreMobileBackGuard();
+  if (state.waitingForFrame) {
+    setStatus("Loading");
+    return;
+  }
+  handleBackCommand();
+}
+
+function mobileLayoutViewport() {
+  if (!state.mobileLayoutViewport) {
+    const width = Math.max(320, Math.min(MOBILE_VIEWPORT_MAX_WIDTH, Math.floor(window.innerWidth || 390)));
+    const toolbarHeight = toolbar.getBoundingClientRect().height || 0;
+    const height = Math.max(360, Math.min(1200, Math.floor((window.innerHeight || 720) - toolbarHeight)));
+    state.mobileLayoutViewport = { width, height };
+  }
+  return state.mobileLayoutViewport;
+}
+
+function isMobileKeyboardResize() {
+  if (!state.mobileClient || !state.mobileLayoutViewport || !window.visualViewport) {
+    return false;
+  }
+  return window.visualViewport.height < window.innerHeight * 0.82;
+}
+
 function measureViewport() {
   const rect = viewportWrap.getBoundingClientRect();
+  if (state.mobileClient) {
+    return mobileLayoutViewport();
+  }
   return {
     width: Math.max(320, Math.min(1920, Math.floor(rect.width || 1280))),
     height: Math.max(240, Math.min(1600, Math.floor(rect.height || 720))),
   };
+}
+
+function decodeLockPathValue(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new Error("Locked URL path is malformed.");
+  }
+}
+
+function normalizeLockUrl(candidate) {
+  const value = candidate.trim();
+  if (!value) {
+    throw new Error("Locked URL path is empty.");
+  }
+  return value;
+}
+
+function appendCurrentUrlSuffix(candidate) {
+  const hashIndex = candidate.indexOf("#");
+  const base = hashIndex === -1 ? candidate : candidate.slice(0, hashIndex);
+  const embeddedHash = hashIndex === -1 ? "" : candidate.slice(hashIndex);
+  let result = base;
+  if (window.location.search) {
+    result += base.includes("?") ? `&${window.location.search.slice(1)}` : window.location.search;
+  }
+  return `${result}${embeddedHash || window.location.hash || ""}`;
+}
+
+function lockUrlFromLocation() {
+  const prefix = "/lock_url/";
+  if (!window.location.pathname.startsWith(prefix)) {
+    return "";
+  }
+  const rawPath = window.location.pathname.slice(prefix.length);
+  if (!rawPath) {
+    throw new Error("Locked URL path is empty.");
+  }
+  const pathParts = rawPath.split("/");
+  const scheme = decodeLockPathValue(pathParts[0] || "").toLowerCase();
+  let candidate;
+  if ((scheme === "http" || scheme === "https") && pathParts.length > 1) {
+    const rest = decodeLockPathValue(pathParts.slice(1).join("/"));
+    if (!rest) {
+      throw new Error("Locked URL path must include a host name.");
+    }
+    candidate = `${scheme}://${rest}`;
+  } else {
+    candidate = decodeLockPathValue(rawPath);
+  }
+  return normalizeLockUrl(appendCurrentUrlSuffix(candidate));
 }
 
 async function loadClientConfig() {
@@ -82,8 +293,9 @@ async function loadClientConfig() {
   if (!response.ok) {
     throw new Error(body.detail || "Could not load server configuration.");
   }
-  state.locked = Boolean(body.locked);
-  state.lockUrl = body.lock_url || "";
+  const pathLockUrl = lockUrlFromLocation();
+  state.locked = Boolean(body.locked || pathLockUrl);
+  state.lockUrl = body.lock_url || pathLockUrl || "";
 }
 
 function applyLockedMode() {
@@ -102,10 +314,21 @@ function applyLockedMode() {
 
 async function createSession(url) {
   const viewport = measureViewport();
+  state.lastSentViewport = viewport;
+  const payload = {
+    url,
+    width: viewport.width,
+    height: viewport.height,
+    is_mobile: state.mobileClient,
+    device_scale_factor: Math.max(1, Math.min(4, window.devicePixelRatio || 1)),
+  };
+  if (state.locked && state.lockUrl) {
+    payload.lock_url = state.lockUrl;
+  }
   const response = await fetch("/api/sessions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url, width: viewport.width, height: viewport.height }),
+    body: JSON.stringify(payload),
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -114,17 +337,50 @@ async function createSession(url) {
   return body;
 }
 
+async function restoreCurrentSession() {
+  const response = await fetch("/api/sessions/current");
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(body.detail || "Could not restore the current session.");
+  }
+  if (!body.session_id) {
+    return false;
+  }
+  state.sessionId = body.session_id;
+  addressInput.value = body.url || "";
+  if (body.locked) {
+    state.locked = true;
+    state.lockUrl = body.url || state.lockUrl;
+    applyLockedMode();
+  } else {
+    launcher.hidden = true;
+  }
+  connectSession(state.sessionId);
+  return true;
+}
+
 function connectSession(sessionId) {
+  if (state.socket) {
+    state.socket.__websiteAgentIntentionalClose = true;
+    state.socket.close();
+  }
+  state.intentionalSocketClose = false;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${protocol}//${window.location.host}/ws/${sessionId}`);
   state.socket = socket;
 
   socket.addEventListener("open", () => {
+    state.reconnectAttempts = 0;
     state.connected = true;
     setControlsEnabled(true);
     setStatus("Connected");
+    if (!state.waitingForFrame) {
+      showLoading();
+    }
     sendResize();
-    focusInputProxy();
+    if (!state.mobileClient) {
+      focusInputProxy();
+    }
   });
 
   socket.addEventListener("message", (event) => {
@@ -133,17 +389,68 @@ function connectSession(sessionId) {
   });
 
   socket.addEventListener("close", () => {
+    const intentionalClose = Boolean(socket.__websiteAgentIntentionalClose || state.intentionalSocketClose);
+    if (state.socket === socket) {
+      state.socket = null;
+    }
     state.connected = false;
     setControlsEnabled(false);
+    hideLoading();
     if (!state.quitting && state.sessionId) {
       setStatus("Disconnected");
+      if (!intentionalClose) {
+        scheduleReconnect();
+      }
+    }
+    if (state.socket === null) {
+      state.intentionalSocketClose = false;
     }
   });
+}
+
+function scheduleReconnect() {
+  if (!state.sessionId || state.reconnectTimer !== null || state.quitting) {
+    return;
+  }
+  const delay = Math.min(10000, 700 * 2 ** Math.min(4, state.reconnectAttempts));
+  state.reconnectAttempts += 1;
+  state.reconnectTimer = window.setTimeout(() => {
+    state.reconnectTimer = null;
+    reconnectSession();
+  }, delay);
+}
+
+async function reconnectSession() {
+  if (!state.sessionId || state.connected || state.quitting) {
+    return;
+  }
+  setStatus("Reconnecting");
+  try {
+    const response = await fetch("/api/sessions/current");
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.session_id !== state.sessionId) {
+      state.sessionId = null;
+      setStatus("Session expired");
+      state.reconnectAttempts = 0;
+      applyLockedMode();
+      if (state.locked) {
+        startLockedSession();
+      }
+      return;
+    }
+    if (body.url) {
+      addressInput.value = body.url;
+    }
+    connectSession(state.sessionId);
+  } catch {
+    scheduleReconnect();
+  }
 }
 
 function resetViewport() {
   context.fillStyle = "#ffffff";
   context.fillRect(0, 0, canvas.width || 1, canvas.height || 1);
+  hideRemoteCaret();
 }
 
 async function quitSession() {
@@ -158,18 +465,27 @@ async function quitSession() {
   setControlsEnabled(false);
   state.quitting = true;
   setStatus("Closing");
+  if (state.reconnectTimer !== null) {
+    window.clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
   if (state.socket) {
+    state.intentionalSocketClose = true;
+    state.socket.__websiteAgentIntentionalClose = true;
     state.socket.close();
     state.socket = null;
   }
   state.connected = false;
   state.sessionId = null;
+  state.lastSentViewport = null;
+  state.mobileLayoutViewport = null;
   try {
     await fetch(`/api/sessions/${sessionId}/close`, { method: "POST" });
   } catch {
     // The browser session may already be gone.
   }
   resetViewport();
+  hideLoading();
   addressInput.value = "";
   launchError.textContent = "";
   launcher.hidden = state.locked;
@@ -187,14 +503,20 @@ function handleServerMessage(message) {
     if (message.url) {
       addressInput.value = message.url;
     }
+    if (message.state === "loading") {
+      state.mobileInputViewArmed = true;
+      showLoading();
+    }
     setStatus(message.state || "Ready");
   } else if (message.type === "error") {
+    hideLoading();
     setStatus("Error");
     launchError.textContent = message.message || "Request failed.";
   } else if (message.type === "warning") {
     setStatus(message.message || "Warning");
   } else if (message.type === "blocked") {
     setStatus("Blocked");
+    state.mobileInputViewArmed = true;
   } else if (message.type === "download") {
     startDownload(message);
   } else if (message.type === "filechooser") {
@@ -203,12 +525,54 @@ function handleServerMessage(message) {
     setStatus(message.dialogType || "Dialog");
   } else if (message.type === "clipboard") {
     handleRemoteClipboard(message.text || "");
+  } else if (message.type === "editable") {
+    handleEditableProbe(message);
   }
+}
+
+function handleEditableProbe(message) {
+  if (!state.mobileClient) {
+    return;
+  }
+  if (message.editable) {
+    state.mobileInputViewArmed = true;
+    focusInputProxy();
+  } else {
+    state.mobileInputViewArmed = true;
+    blurInputProxy();
+  }
+}
+
+function hideRemoteCaret() {
+  state.remoteCaret = null;
+  remoteCaret.hidden = true;
+}
+
+function updateRemoteCaret() {
+  const caret = state.remoteCaret;
+  if (!caret || typeof caret.x !== "number" || typeof caret.y !== "number") {
+    remoteCaret.hidden = true;
+    return;
+  }
+  const display = state.frameDisplay;
+  const scaleX = display.width / Math.max(1, state.frameWidth);
+  const scaleY = display.height / Math.max(1, state.frameHeight);
+  const left = display.offsetX + caret.x * scaleX;
+  const top = display.offsetY + caret.y * scaleY;
+  const width = Math.max(1, caret.width * scaleX);
+  const height = Math.max(8, caret.height * scaleY);
+  remoteCaret.style.left = `${left}px`;
+  remoteCaret.style.top = `${top}px`;
+  remoteCaret.style.width = `${width}px`;
+  remoteCaret.style.height = `${height}px`;
+  remoteCaret.hidden = false;
 }
 
 function drawFrame(message) {
   state.frameWidth = message.width;
   state.frameHeight = message.height;
+  state.remoteCaret =
+    (!state.mobileClient || state.remoteTextFocused) && message.caret ? message.caret : null;
   if (addressInput !== document.activeElement && message.url) {
     addressInput.value = message.url;
   }
@@ -218,7 +582,11 @@ function drawFrame(message) {
       canvas.width = message.width;
       canvas.height = message.height;
     }
+    context.fillStyle = "#111827";
+    context.fillRect(0, 0, canvas.width, canvas.height);
     context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    updateFrameDisplay();
+    hideLoading();
   };
   image.src = `data:${message.mime};base64,${message.image}`;
 }
@@ -233,15 +601,29 @@ function send(message) {
   if (!state.connected || !state.socket || state.socket.readyState !== WebSocket.OPEN) {
     return;
   }
+  if (["navigate", "reload", "back", "forward"].includes(message.type)) {
+    state.mobileInputViewArmed = true;
+    showLoading();
+  }
   state.socket.send(JSON.stringify(message));
 }
 
 function focusInputProxy(clientX, clientY) {
+  state.remoteTextFocused = true;
   if (typeof clientX === "number" && typeof clientY === "number") {
     inputProxy.style.left = `${Math.max(0, Math.floor(clientX))}px`;
     inputProxy.style.top = `${Math.max(0, Math.floor(clientY))}px`;
   }
   inputProxy.focus({ preventScroll: true });
+}
+
+function blurInputProxy() {
+  state.remoteTextFocused = false;
+  state.mobileInputViewArmed = true;
+  hideRemoteCaret();
+  if (document.activeElement === inputProxy) {
+    inputProxy.blur();
+  }
 }
 
 function clearInputProxy() {
@@ -256,7 +638,12 @@ function flushInputProxy() {
   }
   const text = inputProxy.value;
   if (text) {
-    send({ type: "text", text });
+    const shouldFocusView =
+      state.mobileClient && state.remoteTextFocused && state.mobileInputViewArmed;
+    send({ type: "text", text, focus_view: shouldFocusView });
+    if (shouldFocusView) {
+      state.mobileInputViewArmed = false;
+    }
     clearInputProxy();
   }
 }
@@ -265,16 +652,62 @@ function sendResize() {
   if (!state.sessionId) {
     return;
   }
+  if (isMobileKeyboardResize()) {
+    return;
+  }
   const viewport = measureViewport();
+  if (
+    state.lastSentViewport &&
+    state.lastSentViewport.width === viewport.width &&
+    state.lastSentViewport.height === viewport.height
+  ) {
+    return;
+  }
+  state.lastSentViewport = viewport;
   send({ type: "resize", width: viewport.width, height: viewport.height });
 }
 
 function pointerToRemote(event) {
   const rect = canvas.getBoundingClientRect();
+  const display = state.frameDisplay;
+  const relativeX = Math.max(
+    0,
+    Math.min(display.width, event.clientX - rect.left - display.offsetX)
+  );
+  const relativeY = Math.max(
+    0,
+    Math.min(display.height, event.clientY - rect.top - display.offsetY)
+  );
   return {
-    x: ((event.clientX - rect.left) * state.frameWidth) / Math.max(1, rect.width),
-    y: ((event.clientY - rect.top) * state.frameHeight) / Math.max(1, rect.height),
+    x: Math.max(
+      0,
+      Math.min(state.frameWidth, (relativeX * state.frameWidth) / Math.max(1, display.width))
+    ),
+    y: Math.max(
+      0,
+      Math.min(state.frameHeight, (relativeY * state.frameHeight) / Math.max(1, display.height))
+    ),
   };
+}
+
+function updateFrameDisplay() {
+  const rect = canvas.getBoundingClientRect();
+  const frameRatio = state.frameWidth / Math.max(1, state.frameHeight);
+  const rectRatio = rect.width / Math.max(1, rect.height);
+  let width = rect.width;
+  let height = rect.height;
+  if (rectRatio > frameRatio) {
+    width = rect.height * frameRatio;
+  } else {
+    height = rect.width / frameRatio;
+  }
+  state.frameDisplay = {
+    offsetX: Math.max(0, (rect.width - width) / 2),
+    offsetY: Math.max(0, (rect.height - height) / 2),
+    width: Math.max(1, width),
+    height: Math.max(1, height),
+  };
+  updateRemoteCaret();
 }
 
 function pointerButton(event) {
@@ -287,6 +720,252 @@ function pointerButton(event) {
   return "left";
 }
 
+function setTouchPoint(id, point) {
+  state.activeTouches.set(id, {
+    clientX: point.clientX,
+    clientY: point.clientY,
+  });
+}
+
+function deleteTouchPointId(id) {
+  state.activeTouches.delete(id);
+  if (state.activeTouches.size < 2) {
+    state.pinchGesture = null;
+  }
+}
+
+function captureCanvasPointer(event) {
+  try {
+    canvas.setPointerCapture(event.pointerId);
+  } catch {
+    // Synthetic or interrupted touch events may not have an active pointer capture target.
+  }
+}
+
+function releaseCanvasPointer(event) {
+  try {
+    if (canvas.hasPointerCapture(event.pointerId)) {
+      canvas.releasePointerCapture(event.pointerId);
+    }
+  } catch {
+    // The pointer may already have been released by the browser.
+  }
+}
+
+function updateTouchPoint(event) {
+  setTouchPoint(event.pointerId, event);
+}
+
+function deleteTouchPoint(event) {
+  deleteTouchPointId(event.pointerId);
+}
+
+function twoTouchMetrics() {
+  const touches = [...state.activeTouches.values()];
+  if (touches.length < 2) {
+    return null;
+  }
+  const first = touches[0];
+  const second = touches[1];
+  const centerClientX = (first.clientX + second.clientX) / 2;
+  const centerClientY = (first.clientY + second.clientY) / 2;
+  const distance = Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
+  return {
+    centerClientX,
+    centerClientY,
+    distance,
+    centerPoint: pointerToRemote({ clientX: centerClientX, clientY: centerClientY }),
+  };
+}
+
+function beginPinchGesture() {
+  const metrics = twoTouchMetrics();
+  if (!metrics || metrics.distance < PINCH_START_MIN_DISTANCE) {
+    state.pinchGesture = null;
+    return;
+  }
+  clearTouchHoverTimer();
+  state.touchGesture = null;
+  blurInputProxy();
+  state.pinchGesture = {
+    lastSentDistance: metrics.distance,
+    centerPoint: metrics.centerPoint,
+  };
+}
+
+function updatePinchGesture() {
+  const gesture = state.pinchGesture;
+  const metrics = twoTouchMetrics();
+  if (!gesture || !metrics || metrics.distance < PINCH_START_MIN_DISTANCE) {
+    return;
+  }
+  const rawScale = metrics.distance / Math.max(1, gesture.lastSentDistance);
+  const scale = 1 + (rawScale - 1) * PINCH_SCALE_RESPONSE;
+  gesture.centerPoint = metrics.centerPoint;
+  if (Math.abs(scale - 1) < PINCH_STEP_MIN_RATIO) {
+    return;
+  }
+  gesture.lastSentDistance = metrics.distance;
+  send({
+    type: "pinch",
+    x: metrics.centerPoint.x,
+    y: metrics.centerPoint.y,
+    scale,
+  });
+}
+
+function changedTouchById(event, id) {
+  for (const touch of event.changedTouches) {
+    if (touch.identifier === id) {
+      return touch;
+    }
+  }
+  return null;
+}
+
+function clearTouchHoverTimer() {
+  const gesture = state.touchGesture;
+  if (gesture && gesture.hoverTimer !== null) {
+    window.clearTimeout(gesture.hoverTimer);
+    gesture.hoverTimer = null;
+  }
+}
+
+function scheduleTouchHover(gesture) {
+  clearTouchHoverTimer();
+  gesture.hoverTimer = window.setTimeout(() => {
+    if (state.touchGesture !== gesture || gesture.scrolling || gesture.moved) {
+      return;
+    }
+    gesture.hovered = true;
+    send({ type: "mouse_move", ...gesture.lastPoint });
+  }, TOUCH_HOVER_DELAY_MS);
+}
+
+function clearTouchState() {
+  clearTouchHoverTimer();
+  state.touchGesture = null;
+  state.pinchGesture = null;
+  state.activeTouches.clear();
+}
+
+function handleCanvasTouchStart(event) {
+  if (!state.mobileClient) {
+    return;
+  }
+  event.preventDefault();
+  for (const touch of event.changedTouches) {
+    setTouchPoint(touch.identifier, touch);
+  }
+  if (event.touches.length >= 2) {
+    beginPinchGesture();
+    return;
+  }
+  const touch = event.changedTouches[0];
+  if (!touch || event.touches.length !== 1) {
+    return;
+  }
+  const point = pointerToRemote(touch);
+  state.touchGesture = {
+    touchId: touch.identifier,
+    startClientX: touch.clientX,
+    startClientY: touch.clientY,
+    lastClientX: touch.clientX,
+    lastClientY: touch.clientY,
+    startPoint: point,
+    lastPoint: point,
+    moved: false,
+    scrolling: false,
+    hovered: false,
+    hoverTimer: null,
+  };
+  scheduleTouchHover(state.touchGesture);
+}
+
+function handleCanvasTouchMove(event) {
+  if (!state.mobileClient) {
+    return;
+  }
+  event.preventDefault();
+  for (const touch of event.changedTouches) {
+    setTouchPoint(touch.identifier, touch);
+  }
+  if (event.touches.length >= 2 || state.pinchGesture) {
+    if (!state.pinchGesture) {
+      beginPinchGesture();
+    }
+    updatePinchGesture();
+    return;
+  }
+  const gesture = state.touchGesture;
+  if (!gesture) {
+    return;
+  }
+  const touch = changedTouchById(event, gesture.touchId);
+  if (!touch) {
+    return;
+  }
+  const totalX = touch.clientX - gesture.startClientX;
+  const totalY = touch.clientY - gesture.startClientY;
+  const totalDistance = Math.hypot(totalX, totalY);
+  if (totalDistance > TOUCH_TAP_MAX_MOVE) {
+    gesture.moved = true;
+    gesture.scrolling = true;
+    clearTouchHoverTimer();
+  }
+  const deltaX = touch.clientX - gesture.lastClientX;
+  const deltaY = touch.clientY - gesture.lastClientY;
+  gesture.lastClientX = touch.clientX;
+  gesture.lastClientY = touch.clientY;
+  gesture.lastPoint = pointerToRemote(touch);
+  if (!gesture.scrolling || Math.hypot(deltaX, deltaY) < TOUCH_SCROLL_MIN_MOVE) {
+    return;
+  }
+  clearTouchHoverTimer();
+  blurInputProxy();
+  send({
+    type: "wheel",
+    x: gesture.lastPoint.x,
+    y: gesture.lastPoint.y,
+    deltaX: -deltaX * TOUCH_WHEEL_SCALE,
+    deltaY: -deltaY * TOUCH_WHEEL_SCALE,
+  });
+}
+
+function handleCanvasTouchEnd(event) {
+  if (!state.mobileClient) {
+    return;
+  }
+  event.preventDefault();
+  const wasPinching = Boolean(state.pinchGesture) || state.activeTouches.size >= 2;
+  const gesture = state.touchGesture;
+  const touch = gesture ? changedTouchById(event, gesture.touchId) : null;
+  clearTouchHoverTimer();
+  if (!wasPinching && gesture && touch && !gesture.scrolling) {
+    const point = pointerToRemote(touch);
+    focusInputProxy(touch.clientX, touch.clientY);
+    send({ type: "tap", ...point });
+    send({ type: "probe_editable", ...point });
+  }
+  for (const changed of event.changedTouches) {
+    deleteTouchPointId(changed.identifier);
+  }
+  if (event.touches.length === 0) {
+    state.touchGesture = null;
+    state.pinchGesture = null;
+  } else if (event.touches.length < 2) {
+    state.pinchGesture = null;
+  }
+}
+
+function handleCanvasTouchCancel(event) {
+  if (!state.mobileClient) {
+    return;
+  }
+  event.preventDefault();
+  clearTouchState();
+}
+
 launchForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (state.locked) {
@@ -294,6 +973,7 @@ launchForm.addEventListener("submit", async (event) => {
   }
   launchError.textContent = "";
   setStatus("Opening");
+  showLoading();
   const submitButton = launchForm.querySelector("button");
   submitButton.disabled = true;
   try {
@@ -304,6 +984,7 @@ launchForm.addEventListener("submit", async (event) => {
     connectSession(state.sessionId);
   } catch (error) {
     launchError.textContent = error.message;
+    hideLoading();
     setStatus("Idle");
   } finally {
     submitButton.disabled = false;
@@ -316,10 +997,12 @@ addressForm.addEventListener("submit", (event) => {
     return;
   }
   send({ type: "navigate", url: addressInput.value });
-  focusInputProxy();
+  if (!state.mobileClient) {
+    focusInputProxy();
+  }
 });
 
-backButton.addEventListener("click", () => send({ type: "back" }));
+backButton.addEventListener("click", () => handleBackCommand());
 forwardButton.addEventListener("click", () => send({ type: "forward" }));
 reloadButton.addEventListener("click", () => send({ type: "reload" }));
 cookieButton.addEventListener("click", () => {
@@ -332,9 +1015,13 @@ quitButton.addEventListener("click", () => {
   quitSession();
 });
 
+cookieRefreshButton.addEventListener("click", () => {
+  loadCookies({ force: true });
+});
 cookieCloseButton.addEventListener("click", () => closeCookieDialog());
 cookieCancelButton.addEventListener("click", () => closeCookieDialog());
 cookieAddButton.addEventListener("click", () => {
+  markCookieDirty();
   const host = cookieDefaultDomain();
   addCookieRow({
     name: "",
@@ -355,6 +1042,25 @@ cookieAddButton.addEventListener("click", () => {
 });
 cookieSaveButton.addEventListener("click", () => {
   saveCookies();
+});
+cookieJsonRestoreButton.addEventListener("click", () => {
+  restoreCookieJsonFromRows();
+});
+cookieJsonInput.addEventListener("input", () => {
+  markCookieDirty();
+  syncCookieRowsFromJson();
+});
+cookieList.addEventListener("input", (event) => {
+  if (event.target.matches("input, select")) {
+    markCookieDirty();
+    restoreCookieJsonFromRows();
+  }
+});
+cookieList.addEventListener("change", (event) => {
+  if (event.target.matches("input, select")) {
+    markCookieDirty();
+    restoreCookieJsonFromRows();
+  }
 });
 cookieDialog.addEventListener("click", (event) => {
   if (event.target === cookieDialog) {
@@ -383,9 +1089,86 @@ function setCookieBusy(busy) {
   cookieSaveButton.disabled = busy;
   cookieCancelButton.disabled = busy;
   cookieCloseButton.disabled = busy;
+  cookieRefreshButton.disabled = busy;
+  cookieJsonInput.disabled = busy;
+  cookieJsonRestoreButton.disabled = busy;
   for (const control of cookieList.querySelectorAll("input, select, button")) {
     control.disabled = busy;
   }
+}
+
+function normalizeCookiesForSnapshot(cookies) {
+  return [...cookies]
+    .map((cookie) => ({
+      name: String(cookie.name || ""),
+      value: String(cookie.value ?? ""),
+      domain: String(cookie.domain || ""),
+      path: String(cookie.path || "/"),
+      expires:
+        typeof cookie.expires === "number" && Number.isFinite(cookie.expires)
+          ? cookie.expires
+          : null,
+      httpOnly: Boolean(cookie.httpOnly),
+      secure: Boolean(cookie.secure),
+      sameSite: cookie.sameSite || null,
+      partitionKey: cookie.partitionKey || null,
+    }))
+    .sort((left, right) =>
+      `${left.domain}\n${left.path}\n${left.name}`.localeCompare(
+        `${right.domain}\n${right.path}\n${right.name}`
+      )
+    );
+}
+
+function cookieSnapshot(cookies) {
+  return JSON.stringify(normalizeCookiesForSnapshot(cookies));
+}
+
+function markCookieDirty() {
+  if (!cookieDialog.hidden) {
+    state.cookieDirty = true;
+    updateCookieSyncStatus();
+  }
+}
+
+function clearCookieSyncState(cookies) {
+  state.cookieSnapshot = cookieSnapshot(cookies);
+  state.cookieDirty = false;
+  state.cookieServerChanged = false;
+  updateCookieSyncStatus();
+}
+
+function updateCookieSyncStatus() {
+  if (cookieDialog.hidden) {
+    return;
+  }
+  if (state.cookieServerChanged && state.cookieDirty) {
+    cookieSyncStatus.textContent = "Server cookies changed. Refresh to load them.";
+    cookieSyncStatus.hidden = false;
+    return;
+  }
+  if (state.cookieDirty) {
+    cookieSyncStatus.textContent = "Unsaved local changes.";
+    cookieSyncStatus.hidden = false;
+    return;
+  }
+  cookieSyncStatus.textContent = "";
+  cookieSyncStatus.hidden = true;
+}
+
+function startCookieSync() {
+  stopCookieSync();
+  state.cookieSyncTimer = window.setInterval(() => {
+    syncCookiesFromServer();
+  }, COOKIE_SYNC_INTERVAL_MS);
+}
+
+function stopCookieSync() {
+  if (state.cookieSyncTimer !== null) {
+    window.clearInterval(state.cookieSyncTimer);
+    state.cookieSyncTimer = null;
+  }
+  state.cookieSyncInFlight = false;
 }
 
 function openCookieDialog() {
@@ -395,51 +1178,109 @@ function openCookieDialog() {
   cookieDialog.hidden = false;
   cookieSummary.textContent = addressInput.value || "Current page";
   cookieError.textContent = "";
+  cookieSyncStatus.hidden = true;
+  state.cookieSnapshot = "";
+  state.cookieDirty = false;
+  state.cookieServerChanged = false;
   cookieList.replaceChildren();
   const empty = document.createElement("div");
   empty.className = "cookie-empty";
   empty.textContent = "Loading cookies...";
   cookieList.append(empty);
   updateCookieCount();
-  loadCookies();
+  restoreCookieJsonFromRows();
+  loadCookies({ force: true });
+  startCookieSync();
 }
 
 function closeCookieDialog(restoreFocus = true) {
   if (cookieDialog.hidden) {
     return;
   }
+  stopCookieSync();
   cookieDialog.hidden = true;
   cookieError.textContent = "";
-  if (restoreFocus) {
+  cookieSyncStatus.hidden = true;
+  if (restoreFocus && (!state.mobileClient || state.remoteTextFocused)) {
     focusInputProxy();
   }
 }
 
-async function loadCookies() {
+async function fetchCookies() {
+  if (!state.sessionId) {
+    return [];
+  }
+  const response = await fetch(`/api/sessions/${state.sessionId}/cookies`);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(body.detail || "Could not load cookies.");
+  }
+  return body.cookies || [];
+}
+
+function applyCookiesToEditor(cookies) {
+  cookieList.replaceChildren();
+  for (const cookie of cookies) {
+    addCookieRow(cookie, false);
+  }
+  if (!cookieList.children.length) {
+    showEmptyCookies("No cookies for this page.");
+  } else {
+    updateCookieCount();
+    restoreCookieJsonFromRows();
+  }
+  cookieSummary.textContent = addressInput.value || "Current page";
+}
+
+async function loadCookies({ force = false } = {}) {
   if (!state.sessionId) {
     return;
   }
   setCookieBusy(true);
   try {
-    const response = await fetch(`/api/sessions/${state.sessionId}/cookies`);
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(body.detail || "Could not load cookies.");
+    const cookies = await fetchCookies();
+    const nextSnapshot = cookieSnapshot(cookies);
+    if (!force && state.cookieDirty && nextSnapshot !== state.cookieSnapshot) {
+      state.cookieServerChanged = true;
+      updateCookieSyncStatus();
+      return;
     }
-    cookieList.replaceChildren();
-    for (const cookie of body.cookies || []) {
-      addCookieRow(cookie);
-    }
-    if (!cookieList.children.length) {
-      showEmptyCookies("No cookies for this page.");
-    }
-    updateCookieCount();
-    cookieSummary.textContent = addressInput.value || "Current page";
+    applyCookiesToEditor(cookies);
+    clearCookieSyncState(cookies);
   } catch (error) {
     cookieError.textContent = error.message;
-    showEmptyCookies("Cookies are unavailable.");
+    if (force) {
+      showEmptyCookies("Cookies are unavailable.");
+    }
   } finally {
     setCookieBusy(false);
+  }
+}
+
+async function syncCookiesFromServer() {
+  if (cookieDialog.hidden || !state.sessionId || state.cookieSyncInFlight) {
+    return;
+  }
+  state.cookieSyncInFlight = true;
+  try {
+    const cookies = await fetchCookies();
+    const nextSnapshot = cookieSnapshot(cookies);
+    if (nextSnapshot === state.cookieSnapshot) {
+      return;
+    }
+    if (state.cookieDirty) {
+      state.cookieServerChanged = true;
+      updateCookieSyncStatus();
+      return;
+    }
+    applyCookiesToEditor(cookies);
+    clearCookieSyncState(cookies);
+  } catch (error) {
+    if (!state.cookieDirty) {
+      cookieError.textContent = error.message;
+    }
+  } finally {
+    state.cookieSyncInFlight = false;
   }
 }
 
@@ -450,9 +1291,10 @@ function showEmptyCookies(text) {
   empty.textContent = text;
   cookieList.append(empty);
   updateCookieCount();
+  restoreCookieJsonFromRows();
 }
 
-function addCookieRow(cookie) {
+function addCookieRow(cookie, syncJson = true) {
   const empty = cookieList.querySelector(".cookie-empty");
   if (empty) {
     empty.remove();
@@ -475,6 +1317,9 @@ function addCookieRow(cookie) {
     createCookieRemoveButton()
   );
   cookieList.append(row);
+  if (syncJson) {
+    restoreCookieJsonFromRows();
+  }
 }
 
 function createCookieTextField(labelText, field, value) {
@@ -534,11 +1379,13 @@ function createCookieRemoveButton() {
   button.setAttribute("aria-label", "Delete cookie");
   button.textContent = "x";
   button.addEventListener("click", () => {
+    markCookieDirty();
     button.closest(".cookie-row").remove();
     if (!cookieList.querySelector(".cookie-row")) {
       showEmptyCookies("No cookies for this page.");
     } else {
       updateCookieCount();
+      restoreCookieJsonFromRows();
     }
   });
   return button;
@@ -575,8 +1422,121 @@ function collectCookies() {
   return cookies;
 }
 
+function formatCookiesJson(cookies) {
+  return JSON.stringify(cookies, null, 2);
+}
+
+function setCookieJsonError(message) {
+  cookieError.textContent = message;
+  cookieJsonInput.classList.add("invalid");
+}
+
+function clearCookieJsonError() {
+  if (cookieJsonInput.classList.contains("invalid")) {
+    cookieJsonInput.classList.remove("invalid");
+  }
+  if (cookieError.textContent.startsWith("JSON:")) {
+    cookieError.textContent = "";
+  }
+}
+
+function restoreCookieJsonFromRows() {
+  try {
+    cookieJsonInput.value = formatCookiesJson(collectCookies());
+    clearCookieJsonError();
+  } catch (error) {
+    setCookieJsonError(`JSON: ${error.message}`);
+  }
+}
+
+function normalizeCookieFromJson(cookie) {
+  if (!cookie || typeof cookie !== "object" || Array.isArray(cookie)) {
+    throw new Error("Each cookie must be an object.");
+  }
+  const name = String(cookie.name || "").trim();
+  if (!name) {
+    throw new Error("Cookie name is required.");
+  }
+  const sameSite = cookie.sameSite || "Lax";
+  if (!["Lax", "Strict", "None"].includes(sameSite)) {
+    throw new Error(`Invalid SameSite for ${name}.`);
+  }
+  const normalized = {
+    name,
+    value: String(cookie.value ?? ""),
+    domain: String(cookie.domain || cookieDefaultDomain()).trim(),
+    path: String(cookie.path || "/").trim() || "/",
+    sameSite,
+    secure: Boolean(cookie.secure),
+    httpOnly: Boolean(cookie.httpOnly),
+  };
+  if (cookie.expires !== undefined && cookie.expires !== null && cookie.expires !== "") {
+    const expires = Number(cookie.expires);
+    if (!Number.isFinite(expires) || expires <= 0) {
+      throw new Error(`Invalid expires for ${name}.`);
+    }
+    normalized.expires = expires;
+  }
+  if (cookie.partitionKey) {
+    normalized.partitionKey = String(cookie.partitionKey);
+  }
+  return normalized;
+}
+
+function parseCookiesJson() {
+  let parsed;
+  try {
+    parsed = JSON.parse(cookieJsonInput.value);
+  } catch (error) {
+    throw new Error(error.message);
+  }
+  const rawCookies = Array.isArray(parsed) ? parsed : parsed && parsed.cookies;
+  if (!Array.isArray(rawCookies)) {
+    throw new Error("JSON must be an array or an object with a cookies array.");
+  }
+  const cookies = rawCookies.map(normalizeCookieFromJson);
+  const seen = new Set();
+  for (const cookie of cookies) {
+    const key = `${cookie.name}\n${cookie.domain}\n${cookie.path}`;
+    if (seen.has(key)) {
+      throw new Error(`Duplicate cookie: ${cookie.name}`);
+    }
+    seen.add(key);
+  }
+  return cookies;
+}
+
+function renderCookieRows(cookies) {
+  cookieList.replaceChildren();
+  for (const cookie of cookies) {
+    addCookieRow(cookie, false);
+  }
+  if (!cookies.length) {
+    showEmptyCookies("No cookies for this page.");
+  } else {
+    updateCookieCount();
+    restoreCookieJsonFromRows();
+  }
+}
+
+function syncCookieRowsFromJson() {
+  let cookies;
+  try {
+    cookies = parseCookiesJson();
+  } catch (error) {
+    setCookieJsonError(`JSON: ${error.message}`);
+    return;
+  }
+  clearCookieJsonError();
+  renderCookieRows(cookies);
+}
+
 async function saveCookies() {
   if (!state.sessionId) {
+    return;
+  }
+  if (cookieJsonInput.classList.contains("invalid")) {
+    cookieError.textContent = "Fix the JSON editor or use Restore before saving.";
     return;
   }
   let cookies;
@@ -599,13 +1559,17 @@ async function saveCookies() {
       throw new Error(body.detail || "Could not save cookies.");
     }
     cookieList.replaceChildren();
-    for (const cookie of body.cookies || []) {
-      addCookieRow(cookie);
+    const savedCookies = body.cookies || [];
+    for (const cookie of savedCookies) {
+      addCookieRow(cookie, false);
     }
     if (!cookieList.children.length) {
       showEmptyCookies("No cookies for this page.");
+    } else {
+      restoreCookieJsonFromRows();
     }
     updateCookieCount();
+    clearCookieSyncState(savedCookies);
     setStatus("Cookies saved");
   } catch (error) {
     cookieError.textContent = error.message;
@@ -622,23 +1586,38 @@ function updateCookieCount() {
 canvas.addEventListener("contextmenu", (event) => event.preventDefault());
 
 canvas.addEventListener("pointerdown", (event) => {
+  state.lastPointerType = event.pointerType || "";
+  if (state.mobileClient && event.pointerType === "touch") {
+    return;
+  }
   event.preventDefault();
   focusInputProxy(event.clientX, event.clientY);
-  canvas.setPointerCapture(event.pointerId);
+  captureCanvasPointer(event);
   const point = pointerToRemote(event);
   send({ type: "mouse_down", ...point, button: pointerButton(event) });
 });
 
 canvas.addEventListener("pointerup", (event) => {
+  if (state.mobileClient && event.pointerType === "touch") {
+    return;
+  }
   event.preventDefault();
   const point = pointerToRemote(event);
   send({ type: "mouse_up", ...point, button: pointerButton(event) });
-  if (canvas.hasPointerCapture(event.pointerId)) {
-    canvas.releasePointerCapture(event.pointerId);
+  releaseCanvasPointer(event);
+});
+
+canvas.addEventListener("pointercancel", (event) => {
+  if (state.mobileClient && event.pointerType === "touch") {
+    return;
   }
+  releaseCanvasPointer(event);
 });
 
 canvas.addEventListener("pointermove", (event) => {
+  if (state.mobileClient && event.pointerType === "touch") {
+    return;
+  }
   const now = performance.now();
   if (now - state.lastMoveAt < 32) {
     return;
@@ -647,6 +1626,11 @@ canvas.addEventListener("pointermove", (event) => {
   const point = pointerToRemote(event);
   send({ type: "mouse_move", ...point });
 });
+
+canvas.addEventListener("touchstart", handleCanvasTouchStart, { passive: false });
+canvas.addEventListener("touchmove", handleCanvasTouchMove, { passive: false });
+canvas.addEventListener("touchend", handleCanvasTouchEnd, { passive: false });
+canvas.addEventListener("touchcancel", handleCanvasTouchCancel, { passive: false });
 
 canvas.addEventListener(
   "wheel",
@@ -659,6 +1643,9 @@ canvas.addEventListener(
 
 function shouldForwardKeyboard() {
   if (!state.connected) {
+    return false;
+  }
+  if (state.mobileClient && !state.remoteTextFocused) {
     return false;
   }
   const active = document.activeElement;
@@ -841,14 +1828,24 @@ inputProxy.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("resize", () => {
+  updateFrameDisplay();
   window.clearTimeout(window.__agentResizeTimer);
   window.__agentResizeTimer = window.setTimeout(sendResize, 160);
 });
 
-window.addEventListener("beforeunload", () => {
-  if (state.sessionId) {
-    navigator.sendBeacon(`/api/sessions/${state.sessionId}/close`);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", () => {
+    updateFrameDisplay();
+    window.clearTimeout(window.__agentResizeTimer);
+    window.__agentResizeTimer = window.setTimeout(sendResize, 160);
+  });
+}
+
+window.addEventListener("popstate", () => {
+  if (!state.mobileClient || !state.mobileBackGuardInstalled) {
+    return;
   }
+  handleMobileBrowserBack();
 });
 
 async function startLockedSession() {
@@ -858,12 +1855,14 @@ async function startLockedSession() {
     return;
   }
   setStatus("Opening");
+  showLoading();
   try {
     const session = await createSession(state.lockUrl);
     state.sessionId = session.session_id;
     addressInput.value = session.url || state.lockUrl;
     connectSession(state.sessionId);
   } catch (error) {
+    hideLoading();
     setStatus("Error");
     launchError.textContent = error.message;
   }
@@ -871,12 +1870,19 @@ async function startLockedSession() {
 
 async function initializeApp() {
   try {
+    state.mobileClient = detectMobileClient();
+    document.body.classList.toggle("mobile-client", state.mobileClient);
+    installMobileBackGuard();
     await loadClientConfig();
     applyLockedMode();
+    if (await restoreCurrentSession()) {
+      return;
+    }
     if (state.locked) {
       await startLockedSession();
     }
   } catch (error) {
+    hideLoading();
     launcher.hidden = false;
     launchError.textContent = error.message;
     setStatus("Idle");
@@ -910,7 +1916,9 @@ function openFileChooser(message) {
       body: form,
     });
     input.remove();
-    focusInputProxy();
+    if (!state.mobileClient || state.remoteTextFocused) {
+      focusInputProxy();
+    }
   });
   input.click();
 }

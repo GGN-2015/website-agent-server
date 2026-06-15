@@ -26,11 +26,13 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  overscroll-behavior: none;
 }
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -93,7 +95,8 @@ select {
 .icon-button:disabled,
 .cookie-remove-button:disabled,
 input:disabled,
-select:disabled {
+select:disabled,
+textarea:disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
@@ -176,13 +179,94 @@ select:focus {
   display: block;
   width: 100%;
   height: 100%;
+  object-fit: contain;
+  object-position: center center;
   outline: none;
-  background: #ffffff;
+  background: #111827;
   cursor: default;
+  touch-action: none;
+  user-select: none;
 }
 
 #viewport:focus {
   box-shadow: inset 0 0 0 2px rgba(15, 118, 110, 0.75);
+}
+
+.remote-caret {
+  position: absolute;
+  z-index: 1;
+  width: 2px;
+  min-width: 1px;
+  min-height: 8px;
+  background: #ffffff;
+  mix-blend-mode: difference;
+  pointer-events: none;
+  animation: remote-caret-blink 1s steps(1, end) infinite;
+  will-change: opacity, transform;
+}
+
+.remote-caret[hidden] {
+  display: none;
+}
+
+@keyframes remote-caret-blink {
+  0%,
+  49.999% {
+    opacity: 1;
+  }
+
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  background: rgba(17, 24, 39, 0.52);
+  backdrop-filter: blur(1px);
+  pointer-events: auto;
+}
+
+.loading-overlay[hidden] {
+  display: none;
+}
+
+.loading-indicator {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 18px 22px;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 8px;
+  color: #ffffff;
+  background: rgba(17, 24, 39, 0.72);
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.28);
+}
+
+.loading-spinner {
+  width: 34px;
+  height: 34px;
+  border: 3px solid rgba(255, 255, 255, 0.28);
+  border-top-color: #ffffff;
+  border-radius: 50%;
+  animation: spin 0.82s linear infinite;
+}
+
+.loading-text {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .input-proxy {
@@ -201,6 +285,22 @@ select:focus {
   outline: none;
   pointer-events: none;
   resize: none;
+}
+
+body.mobile-client .app-shell {
+  height: 100dvh;
+}
+
+body.mobile-client #viewport {
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+body.mobile-client .input-proxy {
+  width: 32px;
+  height: 32px;
+  opacity: 0.01;
+  font-size: 16px;
 }
 
 .launcher-backdrop {
@@ -310,6 +410,28 @@ select:focus {
   font-size: 13px;
 }
 
+.modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.modal-actions .tool-button {
+  height: 34px;
+  padding: 0 10px;
+}
+
+.cookie-sync-status {
+  margin: 5px 0 0;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.cookie-sync-status[hidden] {
+  display: none;
+}
+
 .icon-button {
   width: 34px;
   height: 34px;
@@ -336,12 +458,69 @@ select:focus {
   padding-top: 10px;
 }
 
+.cookie-editor {
+  display: grid;
+  grid-template-rows: minmax(150px, 1fr) minmax(160px, 0.72fr);
+  min-height: 0;
+  overflow: hidden;
+  background: #f8fafc;
+}
+
 .cookie-list {
   display: grid;
   gap: 10px;
   padding: 14px 16px;
   overflow: auto;
-  background: #f8fafc;
+}
+
+.cookie-json-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.cookie-json-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.cookie-json-header .tool-button {
+  height: 32px;
+  padding: 0 10px;
+}
+
+.cookie-json-input {
+  width: calc(100% - 32px);
+  min-height: 130px;
+  margin: 0 16px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: var(--text);
+  background: #ffffff;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 13px;
+  line-height: 1.45;
+  outline: none;
+  resize: vertical;
+}
+
+.cookie-json-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.18);
+}
+
+.cookie-json-input.invalid {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px rgba(180, 35, 24, 0.14);
 }
 
 .cookie-empty {
@@ -494,6 +673,10 @@ select:focus {
 
   .cookie-row {
     grid-template-columns: 1fr;
+  }
+
+  .cookie-editor {
+    grid-template-rows: minmax(160px, 1fr) minmax(180px, 0.85fr);
   }
 
   .cookie-flags {

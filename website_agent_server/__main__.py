@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from pathlib import Path
 
 import uvicorn
 
 from .config import settings
-from .url_policy import normalize_target_url
+from .url_policy import HostAccessPolicy
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def apply_args(args: argparse.Namespace) -> None:
+async def apply_args(args: argparse.Namespace) -> None:
     settings.host = args.host
     settings.port = args.port
     settings.headless = not args.headed
@@ -114,14 +115,21 @@ def apply_args(args: argparse.Namespace) -> None:
     settings.max_viewport_height = args.max_viewport_height
     settings.data_dir = args.data_dir.resolve()
     settings.pin = args.pin
-    settings.lock_url = normalize_target_url(args.lock_url) if args.lock_url else None
+    if args.lock_url:
+        lock_url_policy = HostAccessPolicy(settings.allow_private_hosts)
+        settings.lock_url = await lock_url_policy.ensure_navigation_url_allowed(
+            args.lock_url,
+            verify_https=not settings.ignore_https_errors,
+        )
+    else:
+        settings.lock_url = None
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        apply_args(args)
+        asyncio.run(apply_args(args))
     except ValueError as exc:
         parser.error(str(exc))
     uvicorn.run(
@@ -129,6 +137,7 @@ def main() -> None:
         host=settings.host,
         port=settings.port,
         reload=False,
+        ws_ping_interval=None,
     )
 
 
