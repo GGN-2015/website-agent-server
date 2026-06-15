@@ -4,9 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-
 @dataclass
 class Settings:
     host: str = "0.0.0.0"
@@ -24,7 +21,7 @@ class Settings:
     min_viewport_height: int = 240
     max_viewport_width: int = 1920
     max_viewport_height: int = 1600
-    data_dir: Path = PROJECT_ROOT / ".agent-data"
+    data_dir: Path = Path(".agent-data")
     pin: str | None = None
     lock_url: str | None = None
     client_session_cookie_name: str = "session-uuid"

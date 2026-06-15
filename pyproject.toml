@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "website-agent-server"
 version = "0.1.0"
@@ -13,6 +17,9 @@ dependencies = [
 
 [project.scripts]
 website-agent-server = "website_agent_server.__main__:main"
+
+[tool.setuptools.package-data]
+website_agent_server = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

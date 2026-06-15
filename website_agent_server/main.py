@@ -13,11 +13,11 @@ from pydantic import BaseModel, Field
 
 from .auth import PinAuth
 from .browser import BrowserManager
-from .config import PROJECT_ROOT, settings
+from .config import settings
 from .url_policy import HostAccessPolicy, URLPolicyError
 
 
-STATIC_DIR = PROJECT_ROOT / "static"
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 PLAYWRIGHT_FILE_PAYLOAD_LIMIT_BYTES = 50 * 1024 * 1024
 manager = BrowserManager(settings)
 pin_auth = PinAuth(settings)
