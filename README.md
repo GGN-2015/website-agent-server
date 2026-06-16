@@ -62,6 +62,10 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | `--headed` | disabled | Run Chromium with a visible browser window. |
 | `--ignore-https-errors` | disabled | Ignore remote TLS certificate errors. |
 | `--allow-private-hosts` | disabled | Allow navigation and resource requests to private, local, or reserved networks. |
+| `--locale` | `zh-CN` | Browser locale exposed to remote sites. |
+| `--timezone-id` | `Asia/Shanghai` | Browser timezone ID exposed to remote sites. |
+| `--accept-language` | `zh-CN,zh;q=0.9,en;q=0.8` | `Accept-Language` header sent by browser contexts. |
+| `--user-agent` | auto | Desktop browser User-Agent. By default the server derives a normal Chrome UA from the bundled Chromium version instead of exposing `HeadlessChrome`. |
 | `--session-ttl-seconds` | `600` | Disconnected client session and client browser context lifetime. A client can reconnect to its cached browser session during this window. |
 | `--navigation-timeout-ms` | `30000` | Navigation timeout. |
 | `--frame-interval-seconds` | `0.18` | Screenshot streaming interval. |
@@ -92,7 +96,9 @@ venv\Scripts\python.exe -m website_agent_server --allow-private-hosts --pin 1234
 
 Each client receives exactly one server-side Playwright `BrowserContext`, keyed only by its local `session-uuid` cookie. Contexts are never shared by IP address, target host, port, URL path, or device class. If the same client opens another target URL before its UUID expires, the old page is closed and the same context is reused, including storage partitions, service workers, permissions, and other browser context state.
 
-Mobile clients use a mobile Playwright browser profile with a narrow viewport, touch support, a mobile Chromium user agent, and mobile Client Hints so upstream responsive sites can select their mobile layout.
+Desktop clients use a regular Chrome-style User-Agent, locale, timezone, `Accept-Language`, and Client Hints by default. This improves compatibility with sites that reject obviously headless browser metadata, but it does not bypass account checks, rate limits, CAPTCHA, or other site access controls.
+
+Mobile clients use a mobile Playwright browser profile with a narrow viewport, touch support, a mobile Chromium user agent, language headers, and mobile Client Hints so upstream responsive sites can select their mobile layout.
 
 The local `session-uuid` cookie only identifies the Website Agent client, not the remote site. If the local page refreshes or the WebSocket drops, the server uses that cookie to reconnect the same client to its existing browser session. Disconnected browser sessions and idle client contexts are removed after `--session-ttl-seconds`, which is 10 minutes by default. When a UUID is removed, its BrowserContext, browsing history, cookies, localStorage, IndexedDB, download files, upload files, and in-memory session records are removed together.
 

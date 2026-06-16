@@ -62,6 +62,10 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | `--headed` | 禁用 | 使用可见浏览器窗口运行 Chromium。 |
 | `--ignore-https-errors` | 禁用 | 忽略远程 TLS 证书错误。 |
 | `--allow-private-hosts` | 禁用 | 允许访问私有、本地或保留网段。 |
+| `--locale` | `zh-CN` | 暴露给远程网站的浏览器语言区域。 |
+| `--timezone-id` | `Asia/Shanghai` | 暴露给远程网站的浏览器时区。 |
+| `--accept-language` | `zh-CN,zh;q=0.9,en;q=0.8` | 浏览器上下文发送的 `Accept-Language` 请求头。 |
+| `--user-agent` | 自动 | 桌面端浏览器 User-Agent。默认会根据内置 Chromium 版本生成普通 Chrome UA，而不是暴露 `HeadlessChrome`。 |
 | `--session-ttl-seconds` | `600` | 客户端断线后的会话和客户端浏览器上下文保留时间。客户端可在该时间内重连到缓存的浏览器会话。 |
 | `--navigation-timeout-ms` | `30000` | 导航超时时间。 |
 | `--frame-interval-seconds` | `0.18` | 截图帧推送间隔。 |
@@ -90,7 +94,9 @@ venv\Scripts\python.exe -m website_agent_server --allow-private-hosts --pin 1234
 
 每个客户端只会得到一个服务端 Playwright `BrowserContext`，它只由本地 `session-uuid` Cookie 决定。上下文不会再按 IP 地址、目标 host、端口、URL 路径或设备类型共享。同一个客户端在 UUID 过期前打开另一个目标 URL 时，旧页面会关闭，但会复用同一个上下文，包括存储分区、Service Worker、权限和其他浏览器上下文状态。
 
-手机端客户端会使用移动端 Playwright 浏览器配置，包括窄视口、触控能力、移动版 Chromium User-Agent 和移动端 Client Hints，方便上游响应式网站选择手机页面。
+桌面端客户端默认会使用普通 Chrome 风格的 User-Agent、语言区域、时区、`Accept-Language` 和 Client Hints。这样可以改善某些网站因为明显的 headless 浏览器元数据而直接拒绝访问的问题，但不会绕过账号校验、限流、验证码或其他网站访问控制。
+
+手机端客户端会使用移动端 Playwright 浏览器配置，包括窄视口、触控能力、移动版 Chromium User-Agent、语言请求头和移动端 Client Hints，方便上游响应式网站选择手机页面。
 
 本地 `session-uuid` Cookie 只用于识别 Website Agent 客户端，不是远程网站 Cookie。如果本地页面刷新或 WebSocket 掉线，服务端会用这个 Cookie 把同一个客户端重新连接到已有浏览器会话。断线浏览器会话和空闲客户端上下文会在 `--session-ttl-seconds` 秒后删除，默认是 10 分钟。某个 UUID 被删除时，它对应的 BrowserContext、浏览历史、Cookie、localStorage、IndexedDB、下载文件、上传文件和内存会话记录会一起删除。
 

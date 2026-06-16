@@ -11,6 +11,10 @@ class Settings:
     headless: bool = True
     ignore_https_errors: bool = False
     allow_private_hosts: bool = False
+    locale: str = "zh-CN"
+    timezone_id: str = "Asia/Shanghai"
+    accept_language: str = "zh-CN,zh;q=0.9,en;q=0.8"
+    user_agent: str | None = None
     session_ttl_seconds: int = 600
     navigation_timeout_ms: int = 30000
     frame_interval_seconds: float = 0.18

@@ -33,6 +33,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow private, local, and reserved network targets.",
     )
     parser.add_argument(
+        "--locale",
+        default=settings.locale,
+        help="Browser locale exposed to remote sites.",
+    )
+    parser.add_argument(
+        "--timezone-id",
+        default=settings.timezone_id,
+        help="Browser timezone ID exposed to remote sites.",
+    )
+    parser.add_argument(
+        "--accept-language",
+        default=settings.accept_language,
+        help="Accept-Language header sent by browser contexts.",
+    )
+    parser.add_argument(
+        "--user-agent",
+        default=settings.user_agent,
+        help=(
+            "Desktop browser User-Agent. By default the server derives a normal "
+            "Chrome UA from the bundled Chromium version instead of exposing "
+            "HeadlessChrome."
+        ),
+    )
+    parser.add_argument(
         "--session-ttl-seconds",
         type=int,
         default=settings.session_ttl_seconds,
@@ -117,6 +141,10 @@ async def apply_args(args: argparse.Namespace) -> None:
     settings.headless = not args.headed
     settings.ignore_https_errors = args.ignore_https_errors
     settings.allow_private_hosts = args.allow_private_hosts
+    settings.locale = args.locale
+    settings.timezone_id = args.timezone_id
+    settings.accept_language = args.accept_language
+    settings.user_agent = args.user_agent
     settings.session_ttl_seconds = args.session_ttl_seconds
     settings.navigation_timeout_ms = args.navigation_timeout_ms
     settings.frame_interval_seconds = args.frame_interval_seconds

@@ -11,6 +11,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Web
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
+from . import __version__
 from .auth import PinAuth
 from .browser import BrowserManager
 from .config import settings
@@ -32,7 +33,7 @@ async def lifespan(_: FastAPI):
         await manager.stop()
 
 
-app = FastAPI(title="Website Agent Server", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Website Agent Server", version=__version__, lifespan=lifespan)
 
 
 class CreateSessionRequest(BaseModel):

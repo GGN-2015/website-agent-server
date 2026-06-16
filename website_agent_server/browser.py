@@ -48,6 +48,11 @@ MOBILE_CLIENT_HINT_HEADERS = {
     "sec-ch-ua-mobile": "?1",
     "sec-ch-ua-platform": '"Android"',
 }
+DESKTOP_CLIENT_HINT_PLATFORM = '"Windows"'
+DESKTOP_USER_AGENT_TEMPLATE = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/{version} Safari/537.36"
+)
 MOUSE_MOVE_MAX_DURATION_SECONDS = 0.1
 MOUSE_MOVE_SPEED_PIXELS_PER_SECOND = 12000.0
 MOUSE_MOVE_STEP_INTERVAL_SECONDS = 0.008
@@ -815,6 +820,7 @@ class DownloadRecord:
 class ClientContextEntry:
     context: BrowserContext
     last_used: float
+    options_signature: tuple[Any, ...]
 
 
 @dataclass
@@ -906,6 +912,10 @@ class BrowserSession:
             "ignore_https_errors": self.settings.ignore_https_errors,
             "viewport": {"width": self.viewport_width, "height": self.viewport_height},
             "device_scale_factor": self._device_scale_factor,
+            "locale": self.settings.locale,
+            "timezone_id": self.settings.timezone_id,
+            "extra_http_headers": self.manager.desktop_extra_http_headers(),
+            "user_agent": self.manager.desktop_user_agent(),
         }
         if self._is_mobile:
             context_options.update(
@@ -1173,14 +1183,15 @@ class BrowserSession:
         url = route.request.url
         try:
             await self.policy.ensure_request_url_allowed(url)
+            headers = self.manager.compatible_request_headers(
+                route.request.headers,
+                is_mobile=self._is_mobile,
+            )
             if time.monotonic() < self._force_reload_until:
-                headers = dict(route.request.headers)
                 headers["cache-control"] = "no-cache"
                 headers["pragma"] = "no-cache"
                 headers["expires"] = "0"
-                await route.continue_(headers=headers)
-            else:
-                await route.continue_()
+            await route.continue_(headers=headers)
         except URLPolicyError as exc:
             await route.abort()
             await self._queue_message({"type": "blocked", "url": url, "reason": str(exc)})
@@ -2498,7 +2509,11 @@ class BrowserManager:
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=self.settings.headless,
-            args=["--disable-dev-shm-usage"],
+            args=[
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                f"--lang={self.settings.locale}",
+            ],
         )
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
@@ -2534,12 +2549,63 @@ class BrowserManager:
             raise RuntimeError("Browser failed to start.")
         return self._browser
 
+    def browser_version(self) -> str:
+        if self._browser is None:
+            return "120.0.0.0"
+        return self._browser.version
+
+    def browser_major_version(self) -> str:
+        version = self.browser_version()
+        major = version.split(".", 1)[0]
+        return major if major.isdigit() else "120"
+
+    def chrome_brands_header(self) -> str:
+        major = self.browser_major_version()
+        return (
+            f'"Chromium";v="{major}", '
+            f'"Google Chrome";v="{major}", '
+            '"Not=A?Brand";v="99"'
+        )
+
+    def desktop_user_agent(self) -> str:
+        if self.settings.user_agent:
+            return self.settings.user_agent
+        return DESKTOP_USER_AGENT_TEMPLATE.format(version=self.browser_version())
+
+    def desktop_extra_http_headers(self) -> dict[str, str]:
+        return {
+            "Accept-Language": self.settings.accept_language,
+            "sec-ch-ua": self.chrome_brands_header(),
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": DESKTOP_CLIENT_HINT_PLATFORM,
+        }
+
+    def mobile_extra_http_headers(self) -> dict[str, str]:
+        return {
+            "Accept-Language": self.settings.accept_language,
+            "sec-ch-ua": self.chrome_brands_header(),
+            **MOBILE_CLIENT_HINT_HEADERS,
+        }
+
+    def compatible_request_headers(
+        self, original_headers: dict[str, str], *, is_mobile: bool = False
+    ) -> dict[str, str]:
+        headers = dict(original_headers)
+        compatible_headers = (
+            self.mobile_extra_http_headers() if is_mobile else self.desktop_extra_http_headers()
+        )
+        if not is_mobile:
+            headers["user-agent"] = self.desktop_user_agent()
+        for key, value in compatible_headers.items():
+            headers[key.lower()] = value
+        return headers
+
     def mobile_context_options(self, width: int, height: int) -> dict[str, Any]:
         options: dict[str, Any] = {
             "is_mobile": True,
             "has_touch": True,
             "screen": {"width": width, "height": height},
-            "extra_http_headers": dict(MOBILE_CLIENT_HINT_HEADERS),
+            "extra_http_headers": self.mobile_extra_http_headers(),
             "user_agent": MOBILE_FALLBACK_USER_AGENT,
         }
         if self._playwright is None:
@@ -2558,11 +2624,15 @@ class BrowserManager:
     async def acquire_context(
         self, client_uuid: str, context_options: dict[str, Any]
     ) -> BrowserContext:
+        options_signature = self._context_options_signature(context_options)
         async with self._client_contexts_lock:
             cached = self._client_contexts.get(client_uuid)
             if cached is not None:
-                cached.last_used = time.monotonic()
-                return cached.context
+                if cached.options_signature == options_signature:
+                    cached.last_used = time.monotonic()
+                    return cached.context
+                self._client_contexts.pop(client_uuid, None)
+                await _ignore_shutdown_disconnect(cached.context.close())
 
             browser = await self.get_browser()
             context = await browser.new_context(**context_options)
@@ -2577,8 +2647,25 @@ class BrowserManager:
             self._client_contexts[client_uuid] = ClientContextEntry(
                 context=context,
                 last_used=time.monotonic(),
+                options_signature=options_signature,
             )
             return context
+
+    def _context_options_signature(self, options: dict[str, Any]) -> tuple[Any, ...]:
+        viewport = options.get("viewport")
+        screen = options.get("screen")
+        headers = options.get("extra_http_headers")
+        return (
+            bool(options.get("is_mobile", False)),
+            bool(options.get("has_touch", False)),
+            options.get("user_agent"),
+            options.get("locale"),
+            options.get("timezone_id"),
+            options.get("device_scale_factor"),
+            tuple(sorted(viewport.items())) if isinstance(viewport, dict) else viewport,
+            tuple(sorted(screen.items())) if isinstance(screen, dict) else screen,
+            tuple(sorted(headers.items())) if isinstance(headers, dict) else headers,
+        )
 
     def touch_context(self, client_uuid: str) -> None:
         cached = self._client_contexts.get(client_uuid)
@@ -2618,7 +2705,9 @@ class BrowserManager:
     async def _guard_shared_context_route(self, route: Route) -> None:
         try:
             await self._shared_context_policy.ensure_request_url_allowed(route.request.url)
-            await route.continue_()
+            await route.continue_(
+                headers=self.compatible_request_headers(route.request.headers)
+            )
         except URLPolicyError:
             await route.abort()
 
