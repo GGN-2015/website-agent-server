@@ -508,9 +508,10 @@ function connectSession(sessionId) {
 
   socket.addEventListener("close", () => {
     const intentionalClose = Boolean(socket.__websiteAgentIntentionalClose || state.intentionalSocketClose);
-    if (state.socket === socket) {
-      state.socket = null;
+    if (state.socket !== socket) {
+      return;
     }
+    state.socket = null;
     state.connected = false;
     setControlsEnabled(false);
     hideLoading();
@@ -551,6 +552,7 @@ function closeAudioSocket() {
   if (!state.audioSocket) {
     return;
   }
+  state.audioSocket.__websiteAgentIntentionalClose = true;
   state.audioSocket.close();
   state.audioSocket = null;
 }

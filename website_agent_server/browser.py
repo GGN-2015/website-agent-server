@@ -837,6 +837,7 @@ class PendingDialog:
 
 @dataclass
 class SessionConnection:
+    client_uuid: str
     websocket: WebSocket
     outgoing: asyncio.Queue[dict[str, Any]]
 
@@ -1007,15 +1008,12 @@ class BrowserSession:
         await websocket.accept()
         outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=10)
         incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
-        previous_connection = self._connections.get(client_uuid)
-        if previous_connection is not None:
-            await _ignore_shutdown_disconnect(
-                previous_connection.websocket.close(code=1001, reason="Reconnected")
-            )
+        connection_id = secrets.token_urlsafe(18)
         self.last_activity = time.monotonic()
         self.disconnected_at = 0.0
         self._connected = True
-        self._connections[client_uuid] = SessionConnection(
+        self._connections[connection_id] = SessionConnection(
+            client_uuid=client_uuid,
             websocket=websocket,
             outgoing=outgoing,
         )
@@ -1042,9 +1040,9 @@ class BrowserSession:
         finally:
             for task in tasks:
                 task.cancel()
-            current = self._connections.get(client_uuid)
+            current = self._connections.get(connection_id)
             if current is not None and current.websocket is websocket:
-                self._connections.pop(client_uuid, None)
+                self._connections.pop(connection_id, None)
             if not self._connections:
                 self._connected = False
                 self.disconnected_at = time.monotonic()
@@ -1057,13 +1055,10 @@ class BrowserSession:
     async def connect_audio(self, client_uuid: str, websocket: WebSocket) -> None:
         await websocket.accept()
         outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=48)
-        previous_connection = self._audio_connections.get(client_uuid)
-        if previous_connection is not None:
-            await _ignore_shutdown_disconnect(
-                previous_connection.websocket.close(code=1001, reason="Reconnected")
-            )
+        connection_id = secrets.token_urlsafe(18)
         self.last_activity = time.monotonic()
-        self._audio_connections[client_uuid] = SessionConnection(
+        self._audio_connections[connection_id] = SessionConnection(
+            client_uuid=client_uuid,
             websocket=websocket,
             outgoing=outgoing,
         )
@@ -1083,16 +1078,26 @@ class BrowserSession:
         finally:
             for task in tasks:
                 task.cancel()
-            current = self._audio_connections.get(client_uuid)
+            current = self._audio_connections.get(connection_id)
             if current is not None and current.websocket is websocket:
-                self._audio_connections.pop(client_uuid, None)
+                self._audio_connections.pop(connection_id, None)
 
     async def disconnect_client(self, client_uuid: str) -> None:
-        connection = self._connections.pop(client_uuid, None)
-        audio_connection = self._audio_connections.pop(client_uuid, None)
-        if connection is not None:
+        connections: list[SessionConnection] = []
+        for connection_id, connection in list(self._connections.items()):
+            if connection.client_uuid == client_uuid:
+                current = self._connections.pop(connection_id, None)
+                if current is connection:
+                    connections.append(connection)
+        audio_connections: list[SessionConnection] = []
+        for connection_id, connection in list(self._audio_connections.items()):
+            if connection.client_uuid == client_uuid:
+                current = self._audio_connections.pop(connection_id, None)
+                if current is connection:
+                    audio_connections.append(connection)
+        for connection in connections:
             await _ignore_shutdown_disconnect(connection.websocket.close(code=1001))
-        if audio_connection is not None:
+        for audio_connection in audio_connections:
             await _ignore_shutdown_disconnect(audio_connection.websocket.close(code=1001))
         if not self._connections:
             self._connected = False
@@ -1100,7 +1105,7 @@ class BrowserSession:
             self._cancel_frame_loop_if_idle()
 
     def connected_client_count(self) -> int:
-        return len(self._connections)
+        return len({connection.client_uuid for connection in self._connections.values()})
 
     async def navigate(self, raw_url: str) -> None:
         page = self._require_page()
