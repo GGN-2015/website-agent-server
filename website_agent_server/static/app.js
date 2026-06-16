@@ -1689,6 +1689,42 @@ function normalizeCookiesForSnapshot(cookies) {
     );
 }
 
+function escapeCookieValueText(value) {
+  let result = "";
+  for (const character of String(value)) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint < 128) {
+      result += character;
+    } else if (codePoint <= 0xffff) {
+      result += `\\u${codePoint.toString(16).padStart(4, "0")}`;
+    } else {
+      const adjusted = codePoint - 0x10000;
+      const high = 0xd800 + (adjusted >> 10);
+      const low = 0xdc00 + (adjusted & 0x3ff);
+      result += `\\u${high.toString(16).padStart(4, "0")}\\u${low.toString(16).padStart(4, "0")}`;
+    }
+  }
+  return result;
+}
+
+function cookieValueToString(value) {
+  if (value === undefined || value === null) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return escapeCookieValueText(value);
+  }
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    Array.isArray(value) ||
+    (typeof value === "object" && value)
+  ) {
+    return escapeCookieValueText(JSON.stringify(value));
+  }
+  return String(value);
+}
+
 function cookieSnapshot(cookies) {
   return JSON.stringify(normalizeCookiesForSnapshot(cookies));
 }
@@ -1876,9 +1912,10 @@ function addCookieRow(cookie, syncJson = true) {
   if (cookie.partitionKey) {
     row.dataset.partitionKey = cookie.partitionKey;
   }
+  const value = cookieValueToString(cookie.value);
   row.append(
     createCookieTextField("Name", "name", cookie.name || ""),
-    createCookieTextField("Value", "value", cookie.value || ""),
+    createCookieTextField("Value", "value", value),
     createCookieTextField("Domain", "domain", cookie.domain || cookieDefaultDomain()),
     createCookieTextField("Path", "path", cookie.path || "/"),
     createSameSiteField(cookie.sameSite || "Lax"),
@@ -2032,7 +2069,7 @@ function normalizeCookieFromJson(cookie) {
   }
   const normalized = {
     name,
-    value: String(cookie.value ?? ""),
+    value: cookieValueToString(cookie.value),
     domain: String(cookie.domain || cookieDefaultDomain()).trim(),
     path: String(cookie.path || "/").trim() || "/",
     sameSite,

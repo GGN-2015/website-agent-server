@@ -4,7 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 import re
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
 
@@ -16,6 +16,7 @@ from . import __version__
 from .auth import PinAuth
 from .browser import BrowserManager
 from .config import settings
+from .cookies import cookie_value_to_string
 from .url_policy import HostAccessPolicy, URLPolicyError
 
 
@@ -79,7 +80,7 @@ class ClipboardResponse(BaseModel):
 
 class CookieRecord(BaseModel):
     name: str = Field(min_length=1, max_length=4096)
-    value: str = Field(default="", max_length=16384)
+    value: Any = ""
     domain: str = Field(default="", max_length=4096)
     path: str = Field(default="/", max_length=4096)
     expires: float | None = None
@@ -93,8 +94,34 @@ class CookieListResponse(BaseModel):
     cookies: list[CookieRecord]
 
 
+class CookieResponseRecord(BaseModel):
+    name: str
+    value: str
+    domain: str
+    path: str
+    expires: float | None = None
+    httpOnly: bool = False
+    secure: bool = False
+    sameSite: str | None = None
+    partitionKey: str | None = None
+
+
+class CookieResponse(BaseModel):
+    cookies: list[CookieResponseRecord]
+
+
 class CookieUpdateRequest(BaseModel):
     cookies: list[CookieRecord]
+
+    def normalized_cookies(self) -> list[dict[str, Any]]:
+        cookies: list[dict[str, Any]] = []
+        for cookie in self.cookies:
+            data = cookie.model_dump()
+            data["value"] = cookie_value_to_string(data.get("value"))
+            if len(data["value"]) > 16384:
+                raise ValueError(f"Cookie value is too long: {data.get('name') or ''}")
+            cookies.append(data)
+        return cookies
 
 
 def _auth_response() -> FileResponse:
@@ -189,6 +216,26 @@ def _set_client_session_cookie(response: Response, client_uuid: str) -> None:
         secure=False,
         path="/",
     )
+
+
+def _cookie_response(cookies: list[dict[str, Any]]) -> CookieResponse:
+    records: list[CookieResponseRecord] = []
+    for cookie in cookies:
+        partition_key = cookie.get("partitionKey")
+        records.append(
+            CookieResponseRecord(
+                name=str(cookie.get("name") or ""),
+                value=cookie_value_to_string(cookie.get("value")),
+                domain=str(cookie.get("domain") or ""),
+                path=str(cookie.get("path") or "/"),
+                expires=cookie.get("expires") if isinstance(cookie.get("expires"), (int, float)) else None,
+                httpOnly=bool(cookie.get("httpOnly", False)),
+                secure=bool(cookie.get("secure", False)),
+                sameSite=cookie.get("sameSite") if isinstance(cookie.get("sameSite"), str) else None,
+                partitionKey=partition_key if isinstance(partition_key, str) and partition_key else None,
+            )
+        )
+    return CookieResponse(cookies=records)
 
 
 def _upload_display_filename(filename: str | None) -> str:
@@ -500,29 +547,29 @@ async def read_clipboard_selection(
     return ClipboardResponse(text=text)
 
 
-@app.get("/api/sessions/{session_id}/cookies", response_model=CookieListResponse)
-async def list_cookies(request: Request, session_id: str) -> CookieListResponse:
+@app.get("/api/sessions/{session_id}/cookies", response_model=CookieResponse)
+async def list_cookies(request: Request, session_id: str) -> CookieResponse:
     pin_auth.require_request(request)
     session = _require_owned_session(request, session_id)
     if session.is_locked:
         raise HTTPException(status_code=403, detail="Cookie management is locked.")
     cookies = await session.list_cookies()
-    return CookieListResponse(cookies=[CookieRecord(**cookie) for cookie in cookies])
+    return _cookie_response(cookies)
 
 
-@app.put("/api/sessions/{session_id}/cookies", response_model=CookieListResponse)
+@app.put("/api/sessions/{session_id}/cookies", response_model=CookieResponse)
 async def update_cookies(
     request: Request, session_id: str, payload: CookieUpdateRequest
-) -> CookieListResponse:
+) -> CookieResponse:
     pin_auth.require_request(request)
     session = _require_owned_session(request, session_id)
     if session.is_locked:
         raise HTTPException(status_code=403, detail="Cookie management is locked.")
     try:
-        cookies = await session.replace_cookies([cookie.model_dump() for cookie in payload.cookies])
+        cookies = await session.replace_cookies(payload.normalized_cookies())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return CookieListResponse(cookies=[CookieRecord(**cookie) for cookie in cookies])
+    return _cookie_response(cookies)
 
 
 @app.websocket("/ws/{session_id}")

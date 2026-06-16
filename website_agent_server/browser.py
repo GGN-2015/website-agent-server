@@ -33,6 +33,7 @@ from playwright.async_api import (
 )
 
 from .config import Settings
+from .cookies import cookie_value_to_string
 from .url_policy import HostAccessPolicy, URLPolicyError
 
 
@@ -2678,7 +2679,7 @@ class BrowserSession:
 
         normalized: dict[str, Any] = {
             "name": name,
-            "value": str(cookie.get("value") or ""),
+            "value": cookie_value_to_string(cookie.get("value")),
             "domain": domain,
             "path": path,
             "httpOnly": bool(cookie.get("httpOnly", False)),
