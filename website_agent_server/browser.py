@@ -1150,10 +1150,9 @@ class BrowserSession:
 
     async def list_cookies(self) -> list[dict[str, Any]]:
         context = self._require_context()
-        page = self._require_page()
         self.last_activity = time.monotonic()
         async with self._action_lock:
-            return await context.cookies([page.url])
+            return await context.cookies()
 
     async def replace_cookies(self, cookies: list[dict[str, Any]]) -> list[dict[str, Any]]:
         context = self._require_context()
@@ -1161,10 +1160,19 @@ class BrowserSession:
         self.last_activity = time.monotonic()
         async with self._action_lock:
             page_url = page.url
-            existing = await context.cookies([page_url])
+            existing = await context.cookies()
             normalized = [self._normalize_cookie(cookie, page_url) for cookie in cookies]
             if normalized:
                 await context.add_cookies(normalized)
+                accepted = {_cookie_identity(cookie) for cookie in await context.cookies()}
+                missing = [
+                    cookie
+                    for cookie in normalized
+                    if _cookie_identity(cookie) not in accepted
+                ]
+                if missing:
+                    names = ", ".join(cookie["name"] for cookie in missing)
+                    raise ValueError(f"Browser did not accept cookie(s): {names}")
             next_keys = {_cookie_identity(cookie) for cookie in normalized}
             for cookie in existing:
                 if _cookie_identity(cookie) not in next_keys:
@@ -1173,7 +1181,7 @@ class BrowserSession:
                         domain=str(cookie.get("domain") or ""),
                         path=str(cookie.get("path") or "/"),
                     )
-            return await context.cookies([page_url])
+            return await context.cookies()
 
     async def handle_message(self, payload: dict[str, Any]) -> None:
         self.last_activity = time.monotonic()
@@ -2685,9 +2693,7 @@ class BrowserSession:
             "httpOnly": bool(cookie.get("httpOnly", False)),
             "secure": bool(cookie.get("secure", False)),
         }
-        expires = cookie.get("expires")
-        if isinstance(expires, (int, float)) and expires > 0:
-            normalized["expires"] = float(expires)
+        # User-managed cookies are scoped to the BrowserContext lifetime.
         same_site = cookie.get("sameSite")
         if same_site in {"Lax", "None", "Strict"}:
             normalized["sameSite"] = same_site
