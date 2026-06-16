@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 import re
@@ -356,6 +357,8 @@ async def create_session(
     request: Request, response: Response, payload: CreateSessionRequest
 ) -> CreateSessionResponse:
     pin_auth.require_request(request)
+    if manager.is_stopping:
+        raise HTTPException(status_code=503, detail="Server is shutting down.")
     client_uuid = _client_session_uuid(request)
     _set_client_session_cookie(response, client_uuid)
     try:
@@ -389,7 +392,11 @@ async def create_session(
         )
     except URLPolicyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except asyncio.CancelledError as exc:
+        raise HTTPException(status_code=503, detail="Server is shutting down.") from exc
     except Exception as exc:
+        if manager.is_stopping:
+            raise HTTPException(status_code=503, detail="Server is shutting down.") from exc
         raise HTTPException(status_code=502, detail=f"Could not open the target site: {exc}") from exc
     page = session.page
     return CreateSessionResponse(session_id=session.id, url=page.url if page is not None else "")

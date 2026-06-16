@@ -2497,6 +2497,7 @@ class BrowserManager:
         self._sessions: dict[str, BrowserSession] = {}
         self._client_sessions: dict[str, str] = {}
         self._client_contexts: dict[str, ClientContextEntry] = {}
+        self._session_start_tasks: set[asyncio.Task[Any]] = set()
         self._client_contexts_lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task[None] | None = None
         self._shared_context_policy = HostAccessPolicy(self.settings.allow_private_hosts)
@@ -2519,6 +2520,7 @@ class BrowserManager:
 
     async def stop(self) -> None:
         self._stopping = True
+        await self._cancel_session_start_tasks()
         cleanup_task = self._cleanup_task
         self._cleanup_task = None
         if cleanup_task is not None:
@@ -2539,6 +2541,24 @@ class BrowserManager:
         self._playwright = None
         if playwright is not None:
             await _ignore_shutdown_disconnect(playwright.stop())
+
+    @property
+    def is_stopping(self) -> bool:
+        return self._stopping
+
+    def request_stop(self) -> None:
+        self._stopping = True
+        for task in list(self._session_start_tasks):
+            if not task.done():
+                task.cancel()
+
+    async def _cancel_session_start_tasks(self) -> None:
+        tasks = [task for task in self._session_start_tasks if not task.done()]
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def get_browser(self) -> Browser:
         if self._stopping:
@@ -2625,6 +2645,7 @@ class BrowserManager:
         self, client_uuid: str, context_options: dict[str, Any]
     ) -> BrowserContext:
         options_signature = self._context_options_signature(context_options)
+        stale_context: BrowserContext | None = None
         async with self._client_contexts_lock:
             cached = self._client_contexts.get(client_uuid)
             if cached is not None:
@@ -2632,7 +2653,7 @@ class BrowserManager:
                     cached.last_used = time.monotonic()
                     return cached.context
                 self._client_contexts.pop(client_uuid, None)
-                await _ignore_shutdown_disconnect(cached.context.close())
+                stale_context = cached.context
 
             browser = await self.get_browser()
             context = await browser.new_context(**context_options)
@@ -2649,7 +2670,9 @@ class BrowserManager:
                 last_used=time.monotonic(),
                 options_signature=options_signature,
             )
-            return context
+        if stale_context is not None:
+            await _ignore_shutdown_disconnect(stale_context.close())
+        return context
 
     def _context_options_signature(self, options: dict[str, Any]) -> tuple[Any, ...]:
         viewport = options.get("viewport")
@@ -2691,8 +2714,22 @@ class BrowserManager:
         session = BrowserSession(self, session_id, client_uuid, lock_url)
         self._sessions[session_id] = session
         self._client_sessions[client_uuid] = session_id
+        start_task: asyncio.Task[None] | None = None
         try:
-            await session.start(raw_url, width, height, is_mobile, device_scale_factor)
+            start_task = asyncio.create_task(
+                session.start(raw_url, width, height, is_mobile, device_scale_factor)
+            )
+            self._session_start_tasks.add(start_task)
+            await start_task
+            if self._stopping:
+                raise RuntimeError("Browser manager is shutting down.")
+        except asyncio.CancelledError:
+            self._sessions.pop(session_id, None)
+            if self._client_sessions.get(client_uuid) == session_id:
+                self._client_sessions.pop(client_uuid, None)
+            await session.close()
+            await self.close_client_context(client_uuid)
+            raise
         except Exception:
             self._sessions.pop(session_id, None)
             if self._client_sessions.get(client_uuid) == session_id:
@@ -2700,6 +2737,9 @@ class BrowserManager:
             await session.close()
             await self.close_client_context(client_uuid)
             raise
+        finally:
+            if start_task is not None:
+                self._session_start_tasks.discard(start_task)
         return session
 
     async def _guard_shared_context_route(self, route: Route) -> None:

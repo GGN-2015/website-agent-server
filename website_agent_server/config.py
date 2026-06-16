@@ -16,6 +16,7 @@ class Settings:
     accept_language: str = "zh-CN,zh;q=0.9,en;q=0.8"
     user_agent: str | None = None
     session_ttl_seconds: int = 600
+    shutdown_timeout_seconds: float = 3.0
     navigation_timeout_ms: int = 30000
     frame_interval_seconds: float = 0.18
     screenshot_quality: int = 95

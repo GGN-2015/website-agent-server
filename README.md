@@ -67,6 +67,7 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | `--accept-language` | `zh-CN,zh;q=0.9,en;q=0.8` | `Accept-Language` header sent by browser contexts. |
 | `--user-agent` | auto | Desktop browser User-Agent. By default the server derives a normal Chrome UA from the bundled Chromium version instead of exposing `HeadlessChrome`. |
 | `--session-ttl-seconds` | `600` | Disconnected client session and client browser context lifetime. A client can reconnect to its cached browser session during this window. |
+| `--shutdown-timeout-seconds` | `3.0` | Maximum graceful shutdown wait for active HTTP/WebSocket connections after Ctrl+C. |
 | `--navigation-timeout-ms` | `30000` | Navigation timeout. |
 | `--frame-interval-seconds` | `0.18` | Screenshot streaming interval. |
 | `--screenshot-quality` | `95` | Frame quality from 1 to 100. Values below 100 use JPEG; 100 uses PNG. |

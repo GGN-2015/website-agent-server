@@ -2,12 +2,40 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import signal
+import threading
 from pathlib import Path
+from types import FrameType
+from collections.abc import Callable, Generator
 
 import uvicorn
+from uvicorn.server import HANDLED_SIGNALS
 
 from .config import settings
 from .url_policy import HostAccessPolicy
+
+
+class WebsiteAgentServer(uvicorn.Server):
+    def __init__(self, config: uvicorn.Config, request_stop: Callable[[], None]) -> None:
+        super().__init__(config)
+        self._request_stop = request_stop
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        self._request_stop()
+        super().handle_exit(sig, frame)
+
+    @contextlib.contextmanager
+    def capture_signals(self) -> Generator[None]:
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        original_handlers = {sig: signal.signal(sig, self.handle_exit) for sig in HANDLED_SIGNALS}
+        try:
+            yield
+        finally:
+            for sig, handler in original_handlers.items():
+                signal.signal(sig, handler)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=settings.session_ttl_seconds,
         help="Idle session lifetime in seconds.",
+    )
+    parser.add_argument(
+        "--shutdown-timeout-seconds",
+        type=float,
+        default=settings.shutdown_timeout_seconds,
+        help="Maximum graceful shutdown wait for active HTTP/WebSocket connections.",
     )
     parser.add_argument(
         "--navigation-timeout-ms",
@@ -146,6 +180,7 @@ async def apply_args(args: argparse.Namespace) -> None:
     settings.accept_language = args.accept_language
     settings.user_agent = args.user_agent
     settings.session_ttl_seconds = args.session_ttl_seconds
+    settings.shutdown_timeout_seconds = max(0.1, args.shutdown_timeout_seconds)
     settings.navigation_timeout_ms = args.navigation_timeout_ms
     settings.frame_interval_seconds = args.frame_interval_seconds
     settings.screenshot_quality = max(1, min(100, args.screenshot_quality))
@@ -174,13 +209,18 @@ def main() -> None:
         asyncio.run(apply_args(args))
     except ValueError as exc:
         parser.error(str(exc))
-    uvicorn.run(
-        "website_agent_server.main:app",
+    from .main import app, manager
+
+    config = uvicorn.Config(
+        app,
         host=settings.host,
         port=settings.port,
         reload=False,
         ws_ping_interval=None,
+        timeout_graceful_shutdown=settings.shutdown_timeout_seconds,
     )
+    server = WebsiteAgentServer(config, manager.request_stop)
+    server.run()
 
 
 if __name__ == "__main__":

@@ -67,6 +67,7 @@ venv\Scripts\python.exe -m website_agent_server --pin 123456
 | `--accept-language` | `zh-CN,zh;q=0.9,en;q=0.8` | 浏览器上下文发送的 `Accept-Language` 请求头。 |
 | `--user-agent` | 自动 | 桌面端浏览器 User-Agent。默认会根据内置 Chromium 版本生成普通 Chrome UA，而不是暴露 `HeadlessChrome`。 |
 | `--session-ttl-seconds` | `600` | 客户端断线后的会话和客户端浏览器上下文保留时间。客户端可在该时间内重连到缓存的浏览器会话。 |
+| `--shutdown-timeout-seconds` | `3.0` | Ctrl+C 后等待活动 HTTP/WebSocket 连接优雅关闭的最长时间。 |
 | `--navigation-timeout-ms` | `30000` | 导航超时时间。 |
 | `--frame-interval-seconds` | `0.18` | 截图帧推送间隔。 |
 | `--screenshot-quality` | `95` | 画面质量，范围 1 到 100。低于 100 使用 JPEG；100 使用 PNG。 |
