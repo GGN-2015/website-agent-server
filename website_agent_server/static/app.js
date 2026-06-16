@@ -48,6 +48,9 @@ const state = {
   pendingFrameHeader: null,
   pendingFrameTimer: null,
   frameObjectUrl: "",
+  activeDialog: null,
+  dialogQueue: [],
+  dialogLastFocus: null,
 };
 window.websiteAgentState = state;
 
@@ -85,6 +88,14 @@ const cookieAddButton = document.getElementById("cookie-add-button");
 const cookieSaveButton = document.getElementById("cookie-save-button");
 const cookieJsonInput = document.getElementById("cookie-json-input");
 const cookieJsonRestoreButton = document.getElementById("cookie-json-restore-button");
+const browserDialog = document.getElementById("browser-dialog");
+const browserDialogTitle = document.getElementById("browser-dialog-title");
+const browserDialogSubtitle = document.getElementById("browser-dialog-subtitle");
+const browserDialogMessage = document.getElementById("browser-dialog-message");
+const browserDialogInputLabel = document.getElementById("browser-dialog-input-label");
+const browserDialogInput = document.getElementById("browser-dialog-input");
+const browserDialogCancelButton = document.getElementById("browser-dialog-cancel-button");
+const browserDialogOkButton = document.getElementById("browser-dialog-ok-button");
 const context = canvas.getContext("2d", { alpha: false });
 const COOKIE_SYNC_INTERVAL_MS = 2500;
 const MOBILE_VIEWPORT_MAX_WIDTH = 430;
@@ -445,6 +456,7 @@ function connectSession(sessionId) {
     state.connected = false;
     setControlsEnabled(false);
     hideLoading();
+    closeBrowserDialog(false, true);
     closeAudioSocket();
     cleanupAudioStreams();
     if (!state.quitting && state.sessionId) {
@@ -755,6 +767,7 @@ async function quitSession() {
     return;
   }
   closeCookieDialog(false);
+  closeBrowserDialog(false, true);
   setControlsEnabled(false);
   state.quitting = true;
   setStatus("Closing");
@@ -825,7 +838,7 @@ function handleServerMessage(message) {
   } else if (message.type === "filechooser") {
     openFileChooser(message);
   } else if (message.type === "dialog") {
-    setStatus(message.dialogType || "Dialog");
+    openBrowserDialog(message);
   } else if (message.type === "clipboard") {
     handleRemoteClipboard(message.text || "");
   } else if (message.type === "editable") {
@@ -997,6 +1010,92 @@ function send(message) {
     armNavigationLoadingTimeout();
   }
   state.socket.send(JSON.stringify(message));
+}
+
+function dialogTitle(dialogType) {
+  if (dialogType === "confirm") {
+    return "Confirm";
+  }
+  if (dialogType === "prompt") {
+    return "Prompt";
+  }
+  if (dialogType === "beforeunload") {
+    return "Leave Page?";
+  }
+  return "Alert";
+}
+
+function dialogSubtitle(dialogType) {
+  if (dialogType === "beforeunload") {
+    return "The remote page is asking before navigation.";
+  }
+  return "The remote page opened a browser dialog.";
+}
+
+function openBrowserDialog(message) {
+  if (!message || !message.token) {
+    return;
+  }
+  if (state.activeDialog) {
+    state.dialogQueue.push(message);
+    return;
+  }
+  state.dialogLastFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  state.activeDialog = message;
+  const dialogType = message.dialogType || "alert";
+  browserDialogTitle.textContent = dialogTitle(dialogType);
+  browserDialogSubtitle.textContent = dialogSubtitle(dialogType);
+  browserDialogMessage.textContent = message.message || "";
+  browserDialogInput.value = message.defaultValue || "";
+  const needsInput = dialogType === "prompt";
+  browserDialogInputLabel.hidden = !needsInput;
+  const hasCancel = dialogType === "confirm" || dialogType === "prompt" || dialogType === "beforeunload";
+  browserDialogCancelButton.hidden = !hasCancel;
+  browserDialogCancelButton.textContent = dialogType === "beforeunload" ? "Stay" : "Cancel";
+  browserDialogOkButton.textContent = dialogType === "beforeunload" ? "Leave" : "OK";
+  browserDialog.hidden = false;
+  setStatus(dialogTitle(dialogType));
+  window.setTimeout(() => {
+    if (needsInput) {
+      browserDialogInput.focus();
+      browserDialogInput.select();
+    } else {
+      browserDialogOkButton.focus();
+    }
+  }, 0);
+}
+
+function closeBrowserDialog(restoreFocus = true, clearQueue = false) {
+  if (clearQueue) {
+    state.dialogQueue = [];
+  }
+  browserDialog.hidden = true;
+  state.activeDialog = null;
+  if (restoreFocus && state.dialogLastFocus && document.contains(state.dialogLastFocus)) {
+    state.dialogLastFocus.focus({ preventScroll: true });
+  } else if (!state.mobileClient || state.remoteTextFocused) {
+    focusInputProxy();
+  }
+  state.dialogLastFocus = null;
+  const nextDialog = clearQueue ? null : state.dialogQueue.shift();
+  if (nextDialog) {
+    window.setTimeout(() => openBrowserDialog(nextDialog), 0);
+  }
+}
+
+function respondToBrowserDialog(accepted) {
+  const dialog = state.activeDialog;
+  if (!dialog) {
+    return;
+  }
+  send({
+    type: "dialog_response",
+    token: dialog.token,
+    accepted,
+    value: browserDialogInput.value,
+  });
+  closeBrowserDialog();
+  setStatus(accepted ? "Dialog accepted" : "Dialog dismissed");
 }
 
 function focusInputProxy(clientX, clientY) {
@@ -1458,6 +1557,23 @@ cookieList.addEventListener("change", (event) => {
 cookieDialog.addEventListener("click", (event) => {
   if (event.target === cookieDialog) {
     closeCookieDialog();
+  }
+});
+browserDialogOkButton.addEventListener("click", () => respondToBrowserDialog(true));
+browserDialogCancelButton.addEventListener("click", () => respondToBrowserDialog(false));
+browserDialog.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !browserDialogCancelButton.hidden) {
+    event.preventDefault();
+    respondToBrowserDialog(false);
+  } else if (event.key === "Enter" && document.activeElement !== browserDialogInput) {
+    event.preventDefault();
+    respondToBrowserDialog(true);
+  }
+});
+browserDialogInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    respondToBrowserDialog(true);
   }
 });
 

@@ -399,7 +399,10 @@ async def create_session(
             raise HTTPException(status_code=503, detail="Server is shutting down.") from exc
         raise HTTPException(status_code=502, detail=f"Could not open the target site: {exc}") from exc
     page = session.page
-    return CreateSessionResponse(session_id=session.id, url=page.url if page is not None else "")
+    page_url = page.url if page is not None else ""
+    if not page_url or page_url == "about:blank":
+        page_url = session.initial_url
+    return CreateSessionResponse(session_id=session.id, url=page_url)
 
 
 @app.post("/api/sessions/{session_id}/close")

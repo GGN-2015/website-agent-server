@@ -116,6 +116,35 @@
       </section>
     </div>
 
+    <div id="browser-dialog" class="modal-backdrop browser-dialog-backdrop" hidden>
+      <section class="modal-panel browser-dialog-panel" role="dialog" aria-modal="true" aria-labelledby="browser-dialog-title">
+        <header class="modal-header">
+          <div>
+            <h2 id="browser-dialog-title">Website Dialog</h2>
+            <p id="browser-dialog-subtitle" class="modal-subtitle">Remote page request</p>
+          </div>
+        </header>
+        <div class="browser-dialog-body">
+          <p id="browser-dialog-message" class="browser-dialog-message"></p>
+          <label id="browser-dialog-input-label" class="browser-dialog-input-label" for="browser-dialog-input" hidden>
+            <span>Response</span>
+            <input
+              id="browser-dialog-input"
+              type="text"
+              autocomplete="off"
+              autocapitalize="off"
+              autocorrect="off"
+              spellcheck="false"
+            />
+          </label>
+        </div>
+        <footer class="modal-footer browser-dialog-footer">
+          <button id="browser-dialog-cancel-button" class="tool-button" type="button">Cancel</button>
+          <button id="browser-dialog-ok-button" class="primary-button" type="button">OK</button>
+        </footer>
+      </section>
+    </div>
+
     <script src="/static/app.js"></script>
   </body>
 </html>

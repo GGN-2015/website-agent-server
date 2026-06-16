@@ -829,6 +829,12 @@ class NavigationEntry:
     url: str
 
 
+@dataclass
+class PendingDialog:
+    dialog: Any
+    future: asyncio.Future[dict[str, Any]]
+
+
 def _cookie_identity(cookie: dict[str, Any]) -> tuple[str, str, str]:
     return (
         str(cookie.get("name") or ""),
@@ -853,12 +859,16 @@ class BrowserSession:
         self.policy = HostAccessPolicy(self.settings.allow_private_hosts)
         self.context: BrowserContext | None = None
         self.page: Page | None = None
+        self.initial_url = ""
         self.viewport_width = 1280
         self.viewport_height = 720
         self.last_activity = time.monotonic()
         self.downloads: dict[str, DownloadRecord] = {}
         self.file_choosers: dict[str, FileChooser] = {}
+        self.pending_dialogs: dict[str, PendingDialog] = {}
+        self._pending_reliable_messages: list[dict[str, Any]] = []
         self._history: list[NavigationEntry] = []
+        self._initial_navigation_task: asyncio.Task[None] | None = None
         self._history_index = -1
         self._history_replaying = False
         self._is_mobile = False
@@ -901,6 +911,7 @@ class BrowserSession:
             raw_url,
             verify_https=not self.settings.ignore_https_errors,
         )
+        self.initial_url = initial_url
         self.viewport_width = _clamp(
             width, self.settings.min_viewport_width, self.settings.max_viewport_width
         )
@@ -926,7 +937,23 @@ class BrowserSession:
         await self.context.grant_permissions(["clipboard-read", "clipboard-write"])
         page = await self.context.new_page()
         await self._prepare_page(page)
-        await self.navigate(initial_url)
+        self._initial_navigation_task = asyncio.create_task(
+            self._run_initial_navigation(initial_url)
+        )
+
+    async def _run_initial_navigation(self, initial_url: str) -> None:
+        try:
+            await self.navigate(initial_url)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._queue_message(
+                {"type": "error", "message": f"Could not open the target site: {exc}"},
+                reliable=True,
+            )
+        finally:
+            if self._initial_navigation_task is asyncio.current_task():
+                self._initial_navigation_task = None
 
     async def close(self) -> None:
         self._closed = True
@@ -941,10 +968,19 @@ class BrowserSession:
         self._outgoing = None
         self._audio_outgoing = None
         self._connected = False
+        initial_navigation_task = self._initial_navigation_task
+        self._initial_navigation_task = None
         requested_frame_task = self._requested_frame_task
         self._requested_frame_task = None
+        if initial_navigation_task is not None:
+            initial_navigation_task.cancel()
+            await asyncio.gather(initial_navigation_task, return_exceptions=True)
         if requested_frame_task is not None:
             requested_frame_task.cancel()
+        for token, pending_dialog in list(self.pending_dialogs.items()):
+            if not pending_dialog.future.done():
+                pending_dialog.future.set_result({"accepted": False, "value": ""})
+            self.pending_dialogs.pop(token, None)
         if websocket is not None:
             await _ignore_shutdown_disconnect(websocket.close(code=1001))
         if audio_websocket is not None:
@@ -957,10 +993,12 @@ class BrowserSession:
         self._history.clear()
         self._history_index = -1
         self._history_replaying = False
+        self._pending_reliable_messages.clear()
 
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
         outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=10)
+        incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
         previous_websocket = self._websocket
         if previous_websocket is not None:
             await _ignore_shutdown_disconnect(
@@ -972,10 +1010,13 @@ class BrowserSession:
         self._outgoing = outgoing
         self._websocket = websocket
         await self._queue_message(self._status_message("connected"))
+        await self._queue_pending_reliable_messages()
+        await self._queue_pending_dialogs()
 
         tasks = {
             asyncio.create_task(self._send_loop(websocket, outgoing)),
-            asyncio.create_task(self._receive_loop(websocket)),
+            asyncio.create_task(self._receive_loop(websocket, incoming)),
+            asyncio.create_task(self._message_loop(incoming)),
             asyncio.create_task(self._frame_loop()),
         }
         try:
@@ -1106,6 +1147,8 @@ class BrowserSession:
         message_type = payload.get("type")
         if message_type == "resize":
             await self._resize(int(payload.get("width", self.viewport_width)), int(payload.get("height", self.viewport_height)))
+        elif message_type == "dialog_response":
+            await self._handle_dialog_response(payload)
         elif message_type == "navigate":
             if self.is_locked:
                 await self._queue_message(
@@ -1274,8 +1317,72 @@ class BrowserSession:
         message = dialog.message
         dialog_type = dialog.type
         default_value = getattr(dialog, "default_value", "") or ""
-        await dialog.accept(default_value)
-        await self._queue_message({"type": "dialog", "dialogType": dialog_type, "message": message})
+        token = secrets.token_urlsafe(18)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self.pending_dialogs[token] = PendingDialog(dialog=dialog, future=future)
+        await self._queue_message(
+            {
+                "type": "dialog",
+                "token": token,
+                "dialogType": dialog_type,
+                "message": message,
+                "defaultValue": default_value,
+            },
+            reliable=True,
+        )
+        try:
+            response = await future
+            accepted = bool(response.get("accepted", True))
+            value = str(response.get("value", default_value))
+            if accepted:
+                await dialog.accept(value)
+            else:
+                await dialog.dismiss()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info("Dialog response failed for session %s: %s", self.id, exc)
+            try:
+                await dialog.dismiss()
+            except Exception:
+                pass
+        finally:
+            self.pending_dialogs.pop(token, None)
+
+    async def _handle_dialog_response(self, payload: dict[str, Any]) -> None:
+        token = str(payload.get("token") or "")
+        pending_dialog = self.pending_dialogs.get(token)
+        if pending_dialog is None or pending_dialog.future.done():
+            return
+        pending_dialog.future.set_result(
+            {
+                "accepted": bool(payload.get("accepted", False)),
+                "value": str(payload.get("value", "")),
+            }
+        )
+
+    async def _queue_pending_dialogs(self) -> None:
+        for token, pending_dialog in list(self.pending_dialogs.items()):
+            if pending_dialog.future.done():
+                continue
+            dialog = pending_dialog.dialog
+            await self._queue_message(
+                {
+                    "type": "dialog",
+                    "token": token,
+                    "dialogType": dialog.type,
+                    "message": dialog.message,
+                    "defaultValue": getattr(dialog, "default_value", "") or "",
+                },
+                reliable=True,
+            )
+
+    async def _queue_pending_reliable_messages(self) -> None:
+        messages = self._pending_reliable_messages
+        self._pending_reliable_messages = []
+        for message in messages:
+            await self._queue_message(message, reliable=True)
 
     async def _on_request(self, request: PlaywrightRequest) -> None:
         page = self.page
@@ -1385,7 +1492,9 @@ class BrowserSession:
                     raise WebSocketDisconnect() from exc
                 raise
 
-    async def _receive_loop(self, websocket: WebSocket) -> None:
+    async def _receive_loop(
+        self, websocket: WebSocket, incoming: asyncio.Queue[dict[str, Any]]
+    ) -> None:
         while True:
             try:
                 text = await websocket.receive_text()
@@ -1398,14 +1507,42 @@ class BrowserSession:
             except json.JSONDecodeError:
                 continue
             if isinstance(payload, dict):
-                try:
-                    await self.handle_message(payload)
-                except URLPolicyError as exc:
-                    await self._queue_message({"type": "error", "message": str(exc)})
-                except Exception as exc:
-                    await self._queue_message(
-                        {"type": "warning", "message": f"Input event ignored: {exc}"}
-                    )
+                if payload.get("type") == "dialog_response":
+                    await self._handle_dialog_response(payload)
+                else:
+                    self._queue_incoming_message(incoming, payload)
+
+    async def _message_loop(self, incoming: asyncio.Queue[dict[str, Any]]) -> None:
+        while True:
+            payload = await incoming.get()
+            try:
+                await self.handle_message(payload)
+            except URLPolicyError as exc:
+                await self._queue_message({"type": "error", "message": str(exc)})
+            except Exception as exc:
+                await self._queue_message(
+                    {"type": "warning", "message": f"Input event ignored: {exc}"}
+                )
+
+    def _queue_incoming_message(
+        self, incoming: asyncio.Queue[dict[str, Any]], payload: dict[str, Any]
+    ) -> None:
+        try:
+            incoming.put_nowait(payload)
+            return
+        except asyncio.QueueFull:
+            pass
+        self._drop_queued_messages(
+            incoming,
+            lambda queued: queued.get("type") in {"mouse_move", "wheel", "probe_editable"},
+            limit=16,
+        )
+        if incoming.full():
+            try:
+                incoming.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+        incoming.put_nowait(payload)
 
     async def _frame_loop(self) -> None:
         while not self._closed:
@@ -2342,9 +2479,15 @@ class BrowserSession:
             "height": self.viewport_height,
         }
 
-    async def _queue_message(self, message: dict[str, Any]) -> None:
+    async def _queue_message(self, message: dict[str, Any], *, reliable: bool = False) -> None:
         queue = self._outgoing
         if queue is None:
+            if reliable and message.get("type") != "dialog":
+                self._pending_reliable_messages.append(message)
+                self._pending_reliable_messages = self._pending_reliable_messages[-32:]
+            return
+        if reliable:
+            await queue.put(message)
             return
         message_type = message.get("type")
         try:
