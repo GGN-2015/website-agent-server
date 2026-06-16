@@ -13,6 +13,8 @@ const state = {
   quitting: false,
   locked: false,
   lockUrl: "",
+  joinSessionId: "",
+  joinMissing: false,
   waitingForFrame: false,
   loadingAwaitingStatusUrl: false,
   loadingTargetUrl: "",
@@ -340,6 +342,22 @@ function lockUrlFromLocation() {
   return normalizeLockUrl(appendCurrentUrlSuffix(candidate));
 }
 
+function joinSessionIdFromLocation() {
+  const prefix = "/uuid/";
+  if (!window.location.pathname.startsWith(prefix)) {
+    return "";
+  }
+  const rawPath = window.location.pathname.slice(prefix.length).replace(/^\/+|\/+$/g, "");
+  if (!rawPath) {
+    return "";
+  }
+  try {
+    return decodeURIComponent(rawPath);
+  } catch {
+    return "";
+  }
+}
+
 async function loadClientConfig() {
   const response = await fetch("/api/config");
   const body = await response.json().catch(() => ({}));
@@ -349,6 +367,8 @@ async function loadClientConfig() {
   const pathLockUrl = lockUrlFromLocation();
   state.locked = Boolean(body.locked || pathLockUrl);
   state.lockUrl = body.lock_url || pathLockUrl || "";
+  state.joinSessionId = body.join_session_id || joinSessionIdFromLocation();
+  state.joinMissing = Boolean(body.join_missing);
 }
 
 function applyLockedMode() {
@@ -390,6 +410,19 @@ async function createSession(url) {
   return body;
 }
 
+async function joinSharedSession(sessionId) {
+  const response = await fetch("/api/sessions/join", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(body.detail || "Session not found.");
+  }
+  return body;
+}
+
 async function restoreCurrentSession() {
   const response = await fetch("/api/sessions/current");
   const body = await response.json().catch(() => ({}));
@@ -410,6 +443,31 @@ async function restoreCurrentSession() {
   }
   connectSession(state.sessionId);
   return true;
+}
+
+async function startJoinedSession() {
+  if (!state.joinSessionId) {
+    return false;
+  }
+  setStatus("Joining");
+  showLoading();
+  try {
+    const session = await joinSharedSession(state.joinSessionId);
+    state.sessionId = session.session_id;
+    addressInput.value = session.url || "";
+    launcher.hidden = true;
+    connectSession(state.sessionId);
+    return true;
+  } catch (error) {
+    state.joinSessionId = "";
+    state.joinMissing = true;
+    state.sessionId = null;
+    hideLoading();
+    setStatus("Idle");
+    launchError.textContent = error.message || "Session not found.";
+    applyLockedMode();
+    return false;
+  }
 }
 
 function connectSession(sessionId) {
@@ -2387,7 +2445,13 @@ async function initializeApp() {
     installMobileBackGuard();
     await loadClientConfig();
     applyLockedMode();
-    if (await restoreCurrentSession()) {
+    if (state.joinMissing) {
+      launchError.textContent = "Shared session was not found. A new client session has been assigned.";
+    }
+    if (await startJoinedSession()) {
+      return;
+    }
+    if (!state.joinMissing && await restoreCurrentSession()) {
       return;
     }
     if (state.locked) {

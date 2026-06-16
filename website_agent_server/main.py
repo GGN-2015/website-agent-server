@@ -51,6 +51,10 @@ class CreateSessionResponse(BaseModel):
     url: str
 
 
+class JoinSessionRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+
+
 class CurrentSessionResponse(BaseModel):
     session_id: str | None = None
     url: str | None = None
@@ -61,6 +65,8 @@ class ClientConfigResponse(BaseModel):
     locked: bool
     lock_url: str | None = None
     global_locked: bool = False
+    join_session_id: str | None = None
+    join_missing: bool = False
 
 
 class ClipboardRequest(BaseModel):
@@ -111,6 +117,9 @@ def _app_response(request: Request) -> FileResponse:
     if request.url.port is not None:
         host = f"{host}:{request.url.port}"
     client_uuid = _client_session_uuid(request)
+    join_session_id = _session_id_from_uuid_path(request.url.path or "")
+    if join_session_id and manager.get_session(join_session_id) is None:
+        client_uuid = _new_client_session_uuid()
     response = FileResponse(STATIC_DIR / "index.html")
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
@@ -146,6 +155,18 @@ def _client_session_uuid(request: Request) -> str:
     return uuid4().hex
 
 
+def _new_client_session_uuid() -> str:
+    return uuid4().hex
+
+
+def _session_id_from_uuid_path(path: str) -> str | None:
+    prefix = "/uuid/"
+    if not path.startswith(prefix):
+        return None
+    session_id = path[len(prefix) :].strip("/")
+    return session_id or None
+
+
 def _set_client_session_cookie(response: Response, client_uuid: str) -> None:
     response.set_cookie(
         settings.client_session_cookie_name,
@@ -172,7 +193,8 @@ def _require_owned_session(request: Request, session_id: str):
     session = manager.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found.")
-    if request.cookies.get(settings.client_session_cookie_name, "") != session.client_uuid:
+    client_uuid = request.cookies.get(settings.client_session_cookie_name, "")
+    if not manager.client_can_access_session(client_uuid, session_id):
         raise HTTPException(status_code=403, detail="Session does not belong to this client.")
     return session
 
@@ -268,6 +290,13 @@ async def index(request: Request) -> FileResponse:
     return _app_response(request)
 
 
+@app.get("/uuid/{session_id:path}")
+async def uuid_session_index(request: Request, session_id: str) -> Response:
+    if not pin_auth.is_request_allowed(request):
+        return _auth_redirect_for(request)
+    return _app_response(request)
+
+
 @app.get("/lock_url/{target:path}")
 async def locked_url_index(request: Request, target: str) -> Response:
     if not pin_auth.is_request_allowed(request):
@@ -307,11 +336,24 @@ async def client_config(request: Request) -> ClientConfigResponse:
         request_lock_url = await _lock_url_from_request_referrer(request)
     except URLPolicyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    join_session_id = None
+    join_missing = False
+    referrer = request.headers.get("referer")
+    if referrer:
+        referrer_parts = urlsplit(referrer)
+        request_host = request.headers.get("host", "")
+        if not referrer_parts.netloc or not request_host or referrer_parts.netloc == request_host:
+            join_session_id = _session_id_from_uuid_path(referrer_parts.path)
+    if join_session_id and manager.get_session(join_session_id) is None:
+        join_missing = True
+        join_session_id = None
     lock_url = settings.lock_url or request_lock_url
     return ClientConfigResponse(
         locked=lock_url is not None,
         lock_url=lock_url,
         global_locked=settings.lock_url is not None,
+        join_session_id=join_session_id,
+        join_missing=join_missing,
     )
 
 
@@ -405,11 +447,31 @@ async def create_session(
     return CreateSessionResponse(session_id=session.id, url=page_url)
 
 
+@app.post("/api/sessions/join", response_model=CreateSessionResponse)
+async def join_session(
+    request: Request, response: Response, payload: JoinSessionRequest
+) -> CreateSessionResponse:
+    pin_auth.require_request(request)
+    client_uuid = _client_session_uuid(request)
+    if manager.get_session(payload.session_id) is None:
+        client_uuid = _new_client_session_uuid()
+        _set_client_session_cookie(response, client_uuid)
+        raise HTTPException(status_code=404, detail="Session not found.")
+    _set_client_session_cookie(response, client_uuid)
+    session = await manager.join_session(payload.session_id, client_uuid)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    page = session.page
+    page_url = page.url if page is not None and not page.is_closed() else session.initial_url
+    return CreateSessionResponse(session_id=session.id, url=page_url)
+
+
 @app.post("/api/sessions/{session_id}/close")
 async def close_session(request: Request, session_id: str) -> dict[str, str]:
     pin_auth.require_request(request)
     _require_owned_session(request, session_id)
-    await manager.close_session(session_id)
+    client_uuid = _client_session_uuid(request)
+    await manager.leave_session(session_id, client_uuid)
     return {"status": "closed"}
 
 
@@ -458,10 +520,10 @@ async def session_socket(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=4404)
         return
     client_uuid = websocket.cookies.get(settings.client_session_cookie_name, "")
-    if client_uuid != session.client_uuid:
+    if not manager.client_can_access_session(client_uuid, session_id):
         await websocket.close(code=4403)
         return
-    await session.connect(websocket)
+    await session.connect(client_uuid, websocket)
 
 
 @app.websocket("/ws/{session_id}/audio")
@@ -474,10 +536,10 @@ async def session_audio_socket(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=4404)
         return
     client_uuid = websocket.cookies.get(settings.client_session_cookie_name, "")
-    if client_uuid != session.client_uuid:
+    if not manager.client_can_access_session(client_uuid, session_id):
         await websocket.close(code=4403)
         return
-    await session.connect_audio(websocket)
+    await session.connect_audio(client_uuid, websocket)
 
 
 @app.get("/api/sessions/{session_id}/downloads/{token}")

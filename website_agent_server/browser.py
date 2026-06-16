@@ -835,6 +835,12 @@ class PendingDialog:
     future: asyncio.Future[dict[str, Any]]
 
 
+@dataclass
+class SessionConnection:
+    websocket: WebSocket
+    outgoing: asyncio.Queue[dict[str, Any]]
+
+
 def _cookie_identity(cookie: dict[str, Any]) -> tuple[str, str, str]:
     return (
         str(cookie.get("name") or ""),
@@ -884,11 +890,10 @@ class BrowserSession:
         self._media_playing = False
         self._action_lock = asyncio.Lock()
         self._frame_capture_lock = asyncio.Lock()
+        self._frame_loop_task: asyncio.Task[None] | None = None
         self._requested_frame_task: asyncio.Task[None] | None = None
-        self._outgoing: asyncio.Queue[dict[str, Any]] | None = None
-        self._audio_outgoing: asyncio.Queue[dict[str, Any]] | None = None
-        self._websocket: WebSocket | None = None
-        self._audio_websocket: WebSocket | None = None
+        self._connections: dict[str, SessionConnection] = {}
+        self._audio_connections: dict[str, SessionConnection] = {}
         self._closed = False
         self._connected = False
         self.disconnected_at = time.monotonic()
@@ -959,32 +964,35 @@ class BrowserSession:
         self._closed = True
         context = self.context
         page = self.page
-        websocket = self._websocket
-        audio_websocket = self._audio_websocket
+        connections = list(self._connections.values())
+        audio_connections = list(self._audio_connections.values())
         self.context = None
         self.page = None
-        self._websocket = None
-        self._audio_websocket = None
-        self._outgoing = None
-        self._audio_outgoing = None
+        self._connections.clear()
+        self._audio_connections.clear()
         self._connected = False
         initial_navigation_task = self._initial_navigation_task
         self._initial_navigation_task = None
+        frame_loop_task = self._frame_loop_task
+        self._frame_loop_task = None
         requested_frame_task = self._requested_frame_task
         self._requested_frame_task = None
         if initial_navigation_task is not None:
             initial_navigation_task.cancel()
             await asyncio.gather(initial_navigation_task, return_exceptions=True)
+        if frame_loop_task is not None:
+            frame_loop_task.cancel()
+            await asyncio.gather(frame_loop_task, return_exceptions=True)
         if requested_frame_task is not None:
             requested_frame_task.cancel()
         for token, pending_dialog in list(self.pending_dialogs.items()):
             if not pending_dialog.future.done():
                 pending_dialog.future.set_result({"accepted": False, "value": ""})
             self.pending_dialogs.pop(token, None)
-        if websocket is not None:
-            await _ignore_shutdown_disconnect(websocket.close(code=1001))
-        if audio_websocket is not None:
-            await _ignore_shutdown_disconnect(audio_websocket.close(code=1001))
+        for connection in connections:
+            await _ignore_shutdown_disconnect(connection.websocket.close(code=1001))
+        for connection in audio_connections:
+            await _ignore_shutdown_disconnect(connection.websocket.close(code=1001))
         pages_to_close = self._session_pages(page)
         for session_page in pages_to_close:
             await _ignore_shutdown_disconnect(session_page.close())
@@ -995,29 +1003,31 @@ class BrowserSession:
         self._history_replaying = False
         self._pending_reliable_messages.clear()
 
-    async def connect(self, websocket: WebSocket) -> None:
+    async def connect(self, client_uuid: str, websocket: WebSocket) -> None:
         await websocket.accept()
         outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=10)
         incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
-        previous_websocket = self._websocket
-        if previous_websocket is not None:
+        previous_connection = self._connections.get(client_uuid)
+        if previous_connection is not None:
             await _ignore_shutdown_disconnect(
-                previous_websocket.close(code=1001, reason="Reconnected")
+                previous_connection.websocket.close(code=1001, reason="Reconnected")
             )
         self.last_activity = time.monotonic()
         self.disconnected_at = 0.0
         self._connected = True
-        self._outgoing = outgoing
-        self._websocket = websocket
+        self._connections[client_uuid] = SessionConnection(
+            websocket=websocket,
+            outgoing=outgoing,
+        )
         await self._queue_message(self._status_message("connected"))
         await self._queue_pending_reliable_messages()
         await self._queue_pending_dialogs()
+        self._ensure_frame_loop()
 
         tasks = {
             asyncio.create_task(self._send_loop(websocket, outgoing)),
             asyncio.create_task(self._receive_loop(websocket, incoming)),
             asyncio.create_task(self._message_loop(incoming)),
-            asyncio.create_task(self._frame_loop()),
         }
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
@@ -1032,28 +1042,31 @@ class BrowserSession:
         finally:
             for task in tasks:
                 task.cancel()
-            if self._outgoing is outgoing:
-                self._outgoing = None
-            if self._websocket is websocket:
-                self._websocket = None
+            current = self._connections.get(client_uuid)
+            if current is not None and current.websocket is websocket:
+                self._connections.pop(client_uuid, None)
+            if not self._connections:
                 self._connected = False
                 self.disconnected_at = time.monotonic()
+                self._cancel_frame_loop_if_idle()
 
     @property
     def is_connected(self) -> bool:
-        return self._connected
+        return bool(self._connections)
 
-    async def connect_audio(self, websocket: WebSocket) -> None:
+    async def connect_audio(self, client_uuid: str, websocket: WebSocket) -> None:
         await websocket.accept()
         outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=48)
-        previous_websocket = self._audio_websocket
-        if previous_websocket is not None:
+        previous_connection = self._audio_connections.get(client_uuid)
+        if previous_connection is not None:
             await _ignore_shutdown_disconnect(
-                previous_websocket.close(code=1001, reason="Reconnected")
+                previous_connection.websocket.close(code=1001, reason="Reconnected")
             )
         self.last_activity = time.monotonic()
-        self._audio_outgoing = outgoing
-        self._audio_websocket = websocket
+        self._audio_connections[client_uuid] = SessionConnection(
+            websocket=websocket,
+            outgoing=outgoing,
+        )
         send_task = asyncio.create_task(self._send_loop(websocket, outgoing))
         receive_task = asyncio.create_task(self._audio_receive_loop(websocket))
         tasks = {send_task, receive_task}
@@ -1070,10 +1083,24 @@ class BrowserSession:
         finally:
             for task in tasks:
                 task.cancel()
-            if self._audio_outgoing is outgoing:
-                self._audio_outgoing = None
-            if self._audio_websocket is websocket:
-                self._audio_websocket = None
+            current = self._audio_connections.get(client_uuid)
+            if current is not None and current.websocket is websocket:
+                self._audio_connections.pop(client_uuid, None)
+
+    async def disconnect_client(self, client_uuid: str) -> None:
+        connection = self._connections.pop(client_uuid, None)
+        audio_connection = self._audio_connections.pop(client_uuid, None)
+        if connection is not None:
+            await _ignore_shutdown_disconnect(connection.websocket.close(code=1001))
+        if audio_connection is not None:
+            await _ignore_shutdown_disconnect(audio_connection.websocket.close(code=1001))
+        if not self._connections:
+            self._connected = False
+            self.disconnected_at = time.monotonic()
+            self._cancel_frame_loop_if_idle()
+
+    def connected_client_count(self) -> int:
+        return len(self._connections)
 
     async def navigate(self, raw_url: str) -> None:
         page = self._require_page()
@@ -1547,7 +1574,24 @@ class BrowserSession:
     async def _frame_loop(self) -> None:
         while not self._closed:
             await asyncio.sleep(await self._current_frame_interval())
+            if not self._connections:
+                return
             await self._send_current_frame()
+
+    def _ensure_frame_loop(self) -> None:
+        if self._closed:
+            return
+        if self._frame_loop_task is not None and not self._frame_loop_task.done():
+            return
+        self._frame_loop_task = asyncio.create_task(self._frame_loop())
+
+    def _cancel_frame_loop_if_idle(self) -> None:
+        if self._connections:
+            return
+        task = self._frame_loop_task
+        self._frame_loop_task = None
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _current_frame_interval(self) -> float:
         if await self._is_media_playing():
@@ -2480,12 +2524,21 @@ class BrowserSession:
         }
 
     async def _queue_message(self, message: dict[str, Any], *, reliable: bool = False) -> None:
-        queue = self._outgoing
-        if queue is None:
+        if not self._connections:
             if reliable and message.get("type") != "dialog":
                 self._pending_reliable_messages.append(message)
                 self._pending_reliable_messages = self._pending_reliable_messages[-32:]
             return
+        for connection in list(self._connections.values()):
+            await self._queue_to_connection(connection.outgoing, message, reliable=reliable)
+
+    async def _queue_to_connection(
+        self,
+        queue: asyncio.Queue[dict[str, Any]],
+        message: dict[str, Any],
+        *,
+        reliable: bool = False,
+    ) -> None:
         if reliable:
             await queue.put(message)
             return
@@ -2521,9 +2574,14 @@ class BrowserSession:
         queue.put_nowait(message)
 
     async def _queue_audio(self, message: dict[str, Any]) -> None:
-        queue = self._audio_outgoing
-        if queue is None:
+        if not self._audio_connections:
             return
+        for connection in list(self._audio_connections.values()):
+            await self._queue_audio_to_connection(connection.outgoing, message)
+
+    async def _queue_audio_to_connection(
+        self, queue: asyncio.Queue[dict[str, Any]], message: dict[str, Any]
+    ) -> None:
         try:
             queue.put_nowait(message)
             return
@@ -2554,19 +2612,20 @@ class BrowserSession:
         queue.put_nowait(message)
 
     async def _queue_frame(self, message: dict[str, Any]) -> None:
-        queue = self._outgoing
-        if queue is None:
+        if not self._connections:
             return
-        self._drop_queued_messages(queue, lambda queued: queued.get("type") == "frame")
-        if queue.full():
-            self._drop_queued_messages(
-                queue,
-                lambda queued: queued.get("type") == "audio" and queued.get("kind") == "chunk",
-                limit=1,
-            )
-        if queue.full():
-            return
-        await queue.put(message)
+        for connection in list(self._connections.values()):
+            queue = connection.outgoing
+            self._drop_queued_messages(queue, lambda queued: queued.get("type") == "frame")
+            if queue.full():
+                self._drop_queued_messages(
+                    queue,
+                    lambda queued: queued.get("type") == "audio" and queued.get("kind") == "chunk",
+                    limit=1,
+                )
+            if queue.full():
+                continue
+            await queue.put(message)
 
     @staticmethod
     def _drop_queued_messages(
@@ -2639,6 +2698,7 @@ class BrowserManager:
         self._browser: Browser | None = None
         self._sessions: dict[str, BrowserSession] = {}
         self._client_sessions: dict[str, str] = {}
+        self._session_clients: dict[str, set[str]] = {}
         self._client_contexts: dict[str, ClientContextEntry] = {}
         self._session_start_tasks: set[asyncio.Task[Any]] = set()
         self._client_contexts_lock = asyncio.Lock()
@@ -2857,6 +2917,7 @@ class BrowserManager:
         session = BrowserSession(self, session_id, client_uuid, lock_url)
         self._sessions[session_id] = session
         self._client_sessions[client_uuid] = session_id
+        self._session_clients[session_id] = {client_uuid}
         start_task: asyncio.Task[None] | None = None
         try:
             start_task = asyncio.create_task(
@@ -2868,6 +2929,7 @@ class BrowserManager:
                 raise RuntimeError("Browser manager is shutting down.")
         except asyncio.CancelledError:
             self._sessions.pop(session_id, None)
+            self._session_clients.pop(session_id, None)
             if self._client_sessions.get(client_uuid) == session_id:
                 self._client_sessions.pop(client_uuid, None)
             await session.close()
@@ -2875,6 +2937,7 @@ class BrowserManager:
             raise
         except Exception:
             self._sessions.pop(session_id, None)
+            self._session_clients.pop(session_id, None)
             if self._client_sessions.get(client_uuid) == session_id:
                 self._client_sessions.pop(client_uuid, None)
             await session.close()
@@ -2910,6 +2973,9 @@ class BrowserManager:
     def get_session(self, session_id: str) -> BrowserSession | None:
         return self._sessions.get(session_id)
 
+    def client_can_access_session(self, client_uuid: str, session_id: str) -> bool:
+        return client_uuid in self._session_clients.get(session_id, set())
+
     def get_session_for_client(self, client_uuid: str) -> BrowserSession | None:
         session_id = self._client_sessions.get(client_uuid)
         if session_id is None:
@@ -2919,14 +2985,49 @@ class BrowserManager:
             self._client_sessions.pop(client_uuid, None)
         return session
 
+    async def join_session(self, session_id: str, client_uuid: str) -> BrowserSession | None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return None
+        previous_session_id = self._client_sessions.get(client_uuid)
+        if previous_session_id and previous_session_id != session_id:
+            await self.leave_session(previous_session_id, client_uuid)
+        self._client_sessions[client_uuid] = session_id
+        self._session_clients.setdefault(session_id, set()).add(client_uuid)
+        session.last_activity = time.monotonic()
+        return session
+
+    async def leave_session(self, session_id: str, client_uuid: str) -> None:
+        session = self._sessions.get(session_id)
+        if self._client_sessions.get(client_uuid) == session_id:
+            self._client_sessions.pop(client_uuid, None)
+        clients = self._session_clients.get(session_id)
+        if clients is not None:
+            clients.discard(client_uuid)
+            if not clients:
+                self._session_clients.pop(session_id, None)
+        if session is not None:
+            await session.disconnect_client(client_uuid)
+            if client_uuid == session.client_uuid and not self._session_clients.get(session_id):
+                await self.close_session(session_id)
+
     async def close_session(self, session_id: str, *, close_context: bool = True) -> None:
         session = self._sessions.pop(session_id, None)
         if session is not None:
             client_uuid = session.client_uuid
-            if self._client_sessions.get(session.client_uuid) == session_id:
-                self._client_sessions.pop(session.client_uuid, None)
+            old_context_active = any(
+                other_session_id != session_id
+                and other_session is not session
+                and other_session.client_uuid == client_uuid
+                for other_session_id, other_session in self._sessions.items()
+            )
+            clients = self._session_clients.pop(session_id, set())
+            clients.add(session.client_uuid)
+            for mapped_client_uuid in clients:
+                if self._client_sessions.get(mapped_client_uuid) == session_id:
+                    self._client_sessions.pop(mapped_client_uuid, None)
             await session.close()
-            if close_context and client_uuid not in self._client_sessions:
+            if close_context and client_uuid not in self._client_sessions and not old_context_active:
                 await self.close_client_context(client_uuid)
 
     async def _cleanup_loop(self) -> None:
@@ -2952,10 +3053,17 @@ class BrowserManager:
             expired = [
                 client_uuid
                 for client_uuid, entry in self._client_contexts.items()
-                if client_uuid not in self._client_sessions and now - entry.last_used > ttl
+                if (
+                    client_uuid not in self._client_sessions
+                    and not self._has_session_for_context_owner(client_uuid)
+                    and now - entry.last_used > ttl
+                )
             ]
         for client_uuid in expired:
             await self.close_client_context(client_uuid)
+
+    def _has_session_for_context_owner(self, client_uuid: str) -> bool:
+        return any(session.client_uuid == client_uuid for session in self._sessions.values())
 
     async def close_client_context(self, client_uuid: str) -> None:
         async with self._client_contexts_lock:
