@@ -117,8 +117,8 @@ def _app_response(request: Request) -> FileResponse:
     if request.url.port is not None:
         host = f"{host}:{request.url.port}"
     client_uuid = _client_session_uuid(request)
-    join_session_id = _session_id_from_uuid_path(request.url.path or "")
-    if join_session_id and manager.get_session(join_session_id) is None:
+    join_key = _share_key_from_uuid_path(request.url.path or "")
+    if join_key and _resolve_shared_session_id(join_key) is None:
         client_uuid = _new_client_session_uuid()
     response = FileResponse(STATIC_DIR / "index.html")
     response.headers["Content-Security-Policy"] = (
@@ -159,12 +159,24 @@ def _new_client_session_uuid() -> str:
     return uuid4().hex
 
 
-def _session_id_from_uuid_path(path: str) -> str | None:
+def _share_key_from_uuid_path(path: str) -> str | None:
     prefix = "/uuid/"
     if not path.startswith(prefix):
         return None
-    session_id = path[len(prefix) :].strip("/")
-    return session_id or None
+    share_key = path[len(prefix) :].strip("/")
+    return share_key or None
+
+
+def _resolve_shared_session_id(share_key: str | None) -> str | None:
+    if not share_key:
+        return None
+    session = manager.get_session(share_key)
+    if session is not None:
+        return session.id
+    session = manager.get_session_for_client(share_key)
+    if session is not None:
+        return session.id
+    return None
 
 
 def _set_client_session_cookie(response: Response, client_uuid: str) -> None:
@@ -343,7 +355,9 @@ async def client_config(request: Request) -> ClientConfigResponse:
         referrer_parts = urlsplit(referrer)
         request_host = request.headers.get("host", "")
         if not referrer_parts.netloc or not request_host or referrer_parts.netloc == request_host:
-            join_session_id = _session_id_from_uuid_path(referrer_parts.path)
+            join_key = _share_key_from_uuid_path(referrer_parts.path)
+            join_session_id = _resolve_shared_session_id(join_key)
+            join_missing = bool(join_key and join_session_id is None)
     if join_session_id and manager.get_session(join_session_id) is None:
         join_missing = True
         join_session_id = None
@@ -453,12 +467,13 @@ async def join_session(
 ) -> CreateSessionResponse:
     pin_auth.require_request(request)
     client_uuid = _client_session_uuid(request)
-    if manager.get_session(payload.session_id) is None:
+    session_id = _resolve_shared_session_id(payload.session_id)
+    if session_id is None:
         client_uuid = _new_client_session_uuid()
         _set_client_session_cookie(response, client_uuid)
         raise HTTPException(status_code=404, detail="Session not found.")
     _set_client_session_cookie(response, client_uuid)
-    session = await manager.join_session(payload.session_id, client_uuid)
+    session = await manager.join_session(session_id, client_uuid)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found.")
     page = session.page
