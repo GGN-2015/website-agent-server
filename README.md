@@ -22,8 +22,9 @@ Create or reuse the repository-root virtual environment:
 ```powershell
 python -m venv venv
 venv\Scripts\python.exe -m pip install -r requirements.txt
-venv\Scripts\python.exe -m playwright install chromium
 ```
+
+Chromium is downloaded automatically on first server startup if Playwright cannot find it. To pre-download it manually, run `venv\Scripts\python.exe -m playwright install chromium`. On Linux, if Chromium downloads successfully but still cannot launch because system packages are missing, run `python -m playwright install-deps chromium` with the needed privileges.
 
 ## Run
 

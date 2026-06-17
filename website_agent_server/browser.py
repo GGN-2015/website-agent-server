@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 import struct
 import zlib
 import json
@@ -8,6 +9,7 @@ import logging
 import re
 import secrets
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -2722,8 +2724,44 @@ class BrowserManager:
         self._stopping = False
         self.settings.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._playwright = await async_playwright().start()
+            self._browser = await self._launch_browser()
+        except Exception:
+            await self._cleanup_failed_start()
+            raise
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    async def _launch_browser(self) -> Browser:
+        playwright = self._playwright
+        if playwright is None:
+            raise RuntimeError("Playwright driver is not started.")
+        try:
+            return await self._launch_chromium(playwright)
+        except Exception as exc:
+            if not _is_missing_playwright_browser(exc):
+                raise
+
+        logger.warning(
+            "Playwright Chromium executable is missing; attempting automatic download."
+        )
+        await self._stop_playwright_driver(suppress_errors=True)
+        await self._install_playwright_chromium()
+
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
+        playwright = self._playwright
+        try:
+            return await self._launch_chromium(playwright)
+        except Exception as exc:
+            raise RuntimeError(
+                "Playwright Chromium was installed but could not be launched. "
+                "On Linux, the browser may still need system packages. Run "
+                f"`{sys.executable} -m playwright install-deps chromium` with the "
+                "needed privileges, then start the server again."
+            ) from exc
+
+    async def _launch_chromium(self, playwright: Playwright) -> Browser:
+        return await playwright.chromium.launch(
             headless=self.settings.headless,
             args=[
                 "--disable-dev-shm-usage",
@@ -2731,7 +2769,53 @@ class BrowserManager:
                 f"--lang={self.settings.locale}",
             ],
         )
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    async def _install_playwright_chromium(self) -> None:
+        command = [sys.executable, "-m", "playwright", "install", "chromium"]
+        logger.warning("Running `%s`.", _format_command(command))
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        stdout_text = _decode_process_output(stdout)
+        stderr_text = _decode_process_output(stderr)
+        if stdout_text:
+            logger.info("Playwright install output:\n%s", stdout_text)
+        if stderr_text:
+            logger.warning("Playwright install diagnostics:\n%s", stderr_text)
+        if process.returncode != 0:
+            details = _join_process_output(stdout_text, stderr_text)
+            raise RuntimeError(
+                "Playwright Chromium is missing and the automatic download failed. "
+                f"Run `{_format_command(command)}` manually, then start the server "
+                "again."
+                + (f"\nInstaller output:\n{details}" if details else "")
+            )
+        logger.info("Playwright Chromium install completed.")
+
+    async def _cleanup_failed_start(self) -> None:
+        browser = self._browser
+        self._browser = None
+        if browser is not None:
+            try:
+                await _ignore_shutdown_disconnect(browser.close())
+            except Exception:
+                logger.debug("Failed to close browser after startup failure.", exc_info=True)
+        await self._stop_playwright_driver(suppress_errors=True)
+
+    async def _stop_playwright_driver(self, *, suppress_errors: bool = False) -> None:
+        playwright = self._playwright
+        self._playwright = None
+        if playwright is None:
+            return
+        try:
+            await _ignore_shutdown_disconnect(playwright.stop())
+        except Exception:
+            if not suppress_errors:
+                raise
+            logger.debug("Failed to stop Playwright driver.", exc_info=True)
 
     async def stop(self) -> None:
         self._stopping = True
@@ -2752,10 +2836,8 @@ class BrowserManager:
         if browser is not None:
             await _ignore_shutdown_disconnect(browser.close())
 
-        playwright = self._playwright
-        self._playwright = None
-        if playwright is not None:
-            await _ignore_shutdown_disconnect(playwright.stop())
+        if self._playwright is not None:
+            await self._stop_playwright_driver()
 
     @property
     def is_stopping(self) -> bool:
@@ -3123,6 +3205,32 @@ async def _ignore_shutdown_disconnect(awaitable: Any) -> None:
     except Exception as exc:
         if not _is_shutdown_disconnect(exc) and not _is_websocket_disconnect(exc):
             raise
+
+
+def _is_missing_playwright_browser(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "executable doesn't exist" in message
+        and (
+            "playwright install" in message
+            or "playwright was just installed or updated" in message
+        )
+    )
+
+
+def _decode_process_output(output: bytes | None) -> str:
+    if not output:
+        return ""
+    return output.decode("utf-8", errors="replace").strip()
+
+
+def _join_process_output(stdout: str, stderr: str) -> str:
+    parts = [part for part in (stdout, stderr) if part]
+    return "\n".join(parts)
+
+
+def _format_command(command: list[str]) -> str:
+    return shlex.join(command)
 
 
 def _is_shutdown_disconnect(exc: Exception) -> bool:

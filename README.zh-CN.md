@@ -22,8 +22,9 @@ Website Agent Server 是一个 Python 服务端浏览器代理。客户端不会
 ```powershell
 python -m venv venv
 venv\Scripts\python.exe -m pip install -r requirements.txt
-venv\Scripts\python.exe -m playwright install chromium
 ```
+
+如果 Playwright 找不到 Chromium，服务端会在首次启动时自动下载。若希望提前下载，可以手动运行 `venv\Scripts\python.exe -m playwright install chromium`。在 Linux 上，如果 Chromium 已经下载成功但仍因为缺少系统依赖无法启动，请用相应权限运行 `python -m playwright install-deps chromium`。
 
 ## 运行
 
